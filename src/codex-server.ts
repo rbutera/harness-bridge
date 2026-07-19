@@ -197,7 +197,12 @@ server.registerTool(
         .string()
         .optional()
         .describe("Working directory (defaults to server cwd)"),
-      model: z.enum(CODEX_MODELS).optional().describe("Override the Codex model"),
+      model: z
+        .enum(CODEX_MODELS)
+        .optional()
+        .describe(
+          "Override the Codex model. OMIT this unless explicitly told otherwise: when omitted, the Codex CLI uses the default from ~/.codex/config.toml, which is kept current. This enum may lag behind newly released models.",
+        ),
       sandbox: z
         .enum(["read-only", "workspace-write", "danger-full-access"])
         .optional()
@@ -355,7 +360,12 @@ server.registerTool(
     inputSchema: {
       task: z.string().describe("What to implement or fix"),
       workingDirectory: z.string().optional(),
-      model: z.enum(CODEX_MODELS).optional().describe("Override the Codex model"),
+      model: z
+        .enum(CODEX_MODELS)
+        .optional()
+        .describe(
+          "Override the Codex model. OMIT this unless explicitly told otherwise: when omitted, the Codex CLI uses the default from ~/.codex/config.toml, which is kept current. This enum may lag behind newly released models.",
+        ),
       sandbox: z
         .enum(["workspace-write", "danger-full-access"])
         .optional()
