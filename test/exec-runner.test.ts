@@ -1,5 +1,10 @@
-import { describe, it, expect } from "vitest";
-import { execCommand, isTransientError } from "../src/lib/exec-runner.js";
+import { afterEach, describe, it, expect } from "vitest";
+import {
+  execCommand,
+  isTransientError,
+  resolveTimeoutMs,
+  TIMEOUT_ENV_VAR,
+} from "../src/lib/exec-runner.js";
 
 describe("execCommand", () => {
   it("captures stdout from a simple command", async () => {
@@ -74,6 +79,56 @@ describe("execCommand", () => {
     // Current depth is 0 (or whatever test env has), child should be +1
     const depth = parseInt(result.stdout.trim(), 10);
     expect(depth).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("resolveTimeoutMs", () => {
+  const saved = {
+    codex: process.env[TIMEOUT_ENV_VAR],
+    legacy: process.env["BRIDGE_TIMEOUT_MS"],
+  };
+
+  afterEach(() => {
+    if (saved.codex === undefined) delete process.env[TIMEOUT_ENV_VAR];
+    else process.env[TIMEOUT_ENV_VAR] = saved.codex;
+    if (saved.legacy === undefined) delete process.env["BRIDGE_TIMEOUT_MS"];
+    else process.env["BRIDGE_TIMEOUT_MS"] = saved.legacy;
+  });
+
+  it("names the documented env var", () => {
+    expect(TIMEOUT_ENV_VAR).toBe("CODEX_BRIDGE_TIMEOUT_MS");
+  });
+
+  it("defaults to 30 minutes when nothing is set", () => {
+    delete process.env[TIMEOUT_ENV_VAR];
+    delete process.env["BRIDGE_TIMEOUT_MS"];
+    expect(resolveTimeoutMs()).toBe(1_800_000);
+  });
+
+  it("reads CODEX_BRIDGE_TIMEOUT_MS", () => {
+    delete process.env["BRIDGE_TIMEOUT_MS"];
+    process.env[TIMEOUT_ENV_VAR] = "123456";
+    expect(resolveTimeoutMs()).toBe(123456);
+  });
+
+  it("falls back to the legacy BRIDGE_TIMEOUT_MS", () => {
+    delete process.env[TIMEOUT_ENV_VAR];
+    process.env["BRIDGE_TIMEOUT_MS"] = "222222";
+    expect(resolveTimeoutMs()).toBe(222222);
+  });
+
+  it("prefers CODEX_BRIDGE_TIMEOUT_MS over the legacy var", () => {
+    process.env[TIMEOUT_ENV_VAR] = "111111";
+    process.env["BRIDGE_TIMEOUT_MS"] = "999999";
+    expect(resolveTimeoutMs()).toBe(111111);
+  });
+
+  it("ignores non-positive / non-numeric values and uses the default", () => {
+    process.env[TIMEOUT_ENV_VAR] = "0";
+    delete process.env["BRIDGE_TIMEOUT_MS"];
+    expect(resolveTimeoutMs()).toBe(1_800_000);
+    process.env[TIMEOUT_ENV_VAR] = "not-a-number";
+    expect(resolveTimeoutMs()).toBe(1_800_000);
   });
 });
 

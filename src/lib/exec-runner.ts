@@ -3,13 +3,18 @@ import { BridgeError } from "./errors.js";
 import { logger } from "./logger.js";
 import type { ExecOptions, ExecResult } from "./types.js";
 
-const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
+const DEFAULT_TIMEOUT_MS = 1_800_000; // 30 minutes
 const MAX_BRIDGE_DEPTH = 2;
 const DEFAULT_MAX_RETRIES = 2;
 const MAX_RETRY_DELAY_MS = 10_000;
 
-function getTimeoutMs(): number {
-  const env = process.env["BRIDGE_TIMEOUT_MS"];
+// Documented knob for the per-call exec timeout. Long reviews (e.g. a multi-doc
+// codex_review_plan) legitimately run for many minutes; raise this if needed.
+export const TIMEOUT_ENV_VAR = "CODEX_BRIDGE_TIMEOUT_MS";
+
+export function resolveTimeoutMs(): number {
+  // BRIDGE_TIMEOUT_MS is the legacy name, kept for back-compat.
+  const env = process.env[TIMEOUT_ENV_VAR] ?? process.env["BRIDGE_TIMEOUT_MS"];
   if (env) {
     const parsed = parseInt(env, 10);
     if (!Number.isNaN(parsed) && parsed > 0) return parsed;
@@ -82,7 +87,7 @@ function sleep(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function execOnce(options: ExecOptions): Promise<ExecResult> {
-  const timeoutMs = options.timeoutMs ?? getTimeoutMs();
+  const timeoutMs = options.timeoutMs ?? resolveTimeoutMs();
   const currentDepth = parseInt(process.env["BRIDGE_DEPTH"] ?? "0", 10);
 
   const env: Record<string, string | undefined> = {

@@ -1,10 +1,9 @@
-export const CODEX_MODELS = [
-  "gpt-5.6-sol",
-  "gpt-5.5",
-  "gpt-5.3-codex",
-  "gpt-5.2-codex",
-  "gpt-5.1-codex-max",
-] as const;
+// Only models a ChatGPT-account Codex CLI accepts. The *-codex variants are
+// hard-rejected ("not supported when using Codex with a ChatGPT account"), so
+// an agent that picks one from the enum gets a hang/timeout, not a downgrade —
+// they are traps, not compatibility. Prefer OMITting the model param entirely
+// so the ~/.codex/config.toml default (kept current) applies.
+export const CODEX_MODELS = ["gpt-5.6-sol", "gpt-5.5"] as const;
 
 export type CodexModel = (typeof CODEX_MODELS)[number];
 

@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { execCommand } from "./lib/exec-runner.js";
+import { execCommand, resolveTimeoutMs, TIMEOUT_ENV_VAR } from "./lib/exec-runner.js";
 import { parseCodexOutput } from "./lib/codex-output-parser.js";
 import { buildExplainCodePrompt, buildPlanPerfPrompt } from "./lib/prompt-builder.js";
 import { createProgressReporter, logger, type ProgressReporter } from "./lib/logger.js";
@@ -109,13 +109,18 @@ async function runCodex(
   }
 
   if (result.timedOut) {
+    const timeoutMs = resolveTimeoutMs();
+    const minutes = Math.round(timeoutMs / 60_000);
     return {
       threadId: null,
       agentMessage: "",
       fileChanges: [],
       commandsExecuted: [],
       usage: null,
-      errors: ["Codex timed out. Increase BRIDGE_TIMEOUT_MS if needed."],
+      errors: [
+        `Codex call exceeded the ${timeoutMs} ms (~${minutes} min) time limit and was terminated before finishing. ` +
+          `Raise it by setting the ${TIMEOUT_ENV_VAR} env var (value in milliseconds) if this call legitimately needs longer.`,
+      ],
     };
   }
 
