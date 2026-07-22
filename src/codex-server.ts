@@ -9,6 +9,7 @@ import { createProgressReporter, logger, type ProgressReporter } from "./lib/log
 import { ThreadRegistry, type SandboxMode } from "./lib/thread-registry.js";
 import { Semaphore, resolveMaxConcurrent } from "./lib/semaphore.js";
 import { buildCodexArgs } from "./lib/codex-args.js";
+import { AppServerClient, isAppServerEnabled } from "./lib/app-server.js";
 import { CODEX_MODELS } from "./lib/types.js";
 import type { CodexResult } from "./lib/types.js";
 
@@ -96,6 +97,65 @@ function reportCodexEvent(line: string, progress: ProgressReporter): void {
   }
 }
 
+/**
+ * Lazily-created app-server connection, shared across calls.
+ *
+ * Not created at module load: the exec backend is the default, and spawning an
+ * app-server nobody asked for would cost a process on every bridge start.
+ */
+let appServer: AppServerClient | null = null;
+
+/**
+ * Phase 2 path. Same inputs, same `CodexResult` out, so it is a drop-in swap.
+ *
+ * Thread bookkeeping stays identical to the exec path, with one relaxation
+ * available later: `thread/resume` accepts a sandbox, so the registry's
+ * refuse-to-resume-on-mismatch rule is a safety net here rather than a
+ * necessity. It is left in place so both backends behave the same way while
+ * this one is still opt-in.
+ */
+async function runViaAppServer(
+  prompt: string,
+  options: {
+    workingDirectory?: string;
+    model?: string;
+    sandbox: SandboxMode;
+    threadKey?: string;
+    resumeThreadId: string | null;
+    progress?: ProgressReporter;
+  },
+): Promise<CodexResult> {
+  appServer ??= new AppServerClient();
+
+  try {
+    const result = await appServer.runTurn({
+      prompt,
+      cwd: options.workingDirectory,
+      sandbox: options.sandbox,
+      model: options.model,
+      resumeThreadId: options.resumeThreadId,
+      progress: options.progress,
+    });
+
+    if (result.threadId) {
+      threads.remember(options.threadKey, result.threadId, options.sandbox);
+    }
+    return result;
+  } catch (error) {
+    // Drop any remembered thread: resuming it after a failure would target a
+    // thread whose state we can no longer reason about.
+    threads.forget(options.threadKey);
+    return {
+      threadId: null,
+      agentMessage: "",
+      fileChanges: [],
+      commandsExecuted: [],
+      usage: null,
+      errors: [error instanceof Error ? error.message : String(error)],
+    };
+  }
+}
+
 async function runCodex(
   prompt: string,
   options: {
@@ -110,6 +170,12 @@ async function runCodex(
   // Default to read-only so an omitted sandbox is never an implicit escalation.
   const sandbox: SandboxMode = options.sandbox ?? "read-only";
   const resumeThreadId = threads.resolve(options.threadKey, sandbox);
+
+  // Backend swap is invisible above this line: the MCP tool surface, and so
+  // every caller and the codex-teammate agent, is identical either way.
+  if (isAppServerEnabled()) {
+    return runViaAppServer(prompt, { ...options, sandbox, resumeThreadId });
+  }
 
   const args = buildCodexArgs({
     prompt,
