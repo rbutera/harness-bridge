@@ -9,6 +9,11 @@ Bidirectional [MCP](https://modelcontextprotocol.io/) server bridge between **Cl
 
 Let Claude and Codex work as partners — each can ask the other for help, review code, explain logic, and plan performance improvements.
 
+> [!NOTE]
+> **This is a fork** of [`Dunqing/claude-codex-bridge`](https://github.com/Dunqing/claude-codex-bridge) (unmaintained since Feb 2026), rebuilt to survive concurrent use. Upstream ran every concurrent call through a single shared thread pointer, silently dropped `--sandbox` on resume, and hardcoded its analysis tools to `read-only` so a reviewer could not run the tests that would verify its own findings.
+>
+> **See [FORK.md](./FORK.md) for the full breakdown.** Short version, all covered below: per-key thread isolation, sandbox-matched resume, caller-controlled sandboxes, bounded concurrency, and an opt-in `codex app-server` backend.
+
 ```
 ┌──────────────┐         MCP          ┌──────────────┐
 │              │ ◄──────────────────► │              │
@@ -169,6 +174,26 @@ For parallel work, spawn Codex as a subagent from Claude Code:
 | `codex_plan_perf`    | Ask Codex to plan performance improvements       |
 | `codex_implement`    | Ask Codex to write or modify code                |
 
+#### Shared arguments (fork additions)
+
+Every `codex_*` tool also accepts these. Both are the point of the fork; see [FORK.md](./FORK.md).
+
+**`sandbox`** — `read-only` | `workspace-write` | `danger-full-access`
+
+Analysis tools default to `read-only`; `codex_implement` defaults to `workspace-write`. Upstream hardcoded the analysis tools, so a reviewer could never run the build or tests that would confirm its own findings.
+
+- Pass `workspace-write` to a reviewer that should **verify** rather than infer.
+- Inside a **git worktree**, implementation needs `danger-full-access`. A worktree's `.git` is a file pointing at `<main-repo>/.git/worktrees/<name>`, outside the workspace, so `workspace-write` blocks commits and breaks test hosts that write outside the tree. (The opt-in app-server backend can instead grant just that directory via `writableRoots`.)
+
+**`threadKey`** — optional string, **omit by default**
+
+Without it every call gets its own Codex thread, which is what keeps parallel reviewers independent. Pass one only for a deliberate multi-turn conversation, and never share a key across calls running at the same time.
+
+Because `codex exec resume` accepts no `--sandbox`, a resumed thread keeps the sandbox it was created with. Asking for a different sandbox under the same key therefore starts a **fresh** thread rather than silently running under the wrong one.
+
+> [!TIP]
+> **Never pass `model`.** Omit it so the `~/.codex/config.toml` default applies. The enum here can lag behind newly released models, and picking from it silently downgrades the result.
+
 ### `ccb-claude` — Codex calls Claude
 
 | Tool                  | Description                                       |
@@ -221,6 +246,24 @@ The agent automatically picks the right Codex tool (`codex_review_code`, `codex_
 | `BRIDGE_MAX_RETRIES` | Auto-retries on transient errors (rate limits, 5xx, network) | `2`               |
 | `BRIDGE_DEBUG`       | Enable debug logging to stderr                               | —                 |
 | `BRIDGE_DEPTH`       | Current recursion depth (set automatically)                  | `0`               |
+| `CODEX_BRIDGE_MAX_CONCURRENT` | Max simultaneous `codex exec` subprocesses (fork) | `4`               |
+| `CODEX_BRIDGE_BACKEND` | Set to `app-server` to use the experimental backend (fork) | `exec`            |
+
+### Concurrency (fork)
+
+`CODEX_BRIDGE_MAX_CONCURRENT` caps in-flight `codex exec` subprocesses. Without a cap, N parallel reviewers spawn N unmanaged processes, each able to hold a slot for the full timeout. Waiters are served FIFO so a burst cannot starve an earlier caller. An invalid value falls back to the default rather than throwing — a typo in a shell profile should not take the bridge down.
+
+Correctness under concurrency comes from thread isolation, not this cap: see `threadKey` above.
+
+### `app-server` backend (fork, experimental)
+
+```bash
+CODEX_BRIDGE_BACKEND=app-server
+```
+
+Drives Codex through the `codex app-server` JSON-RPC service instead of spawning a `codex exec` per call. Threads are first-class in that protocol, so it gains a per-turn sandbox that survives resume, `writableRoots` for least-privilege worktree access, and `turn/interrupt` for cancellation.
+
+**Off by default.** `codex app-server` is still marked experimental in the CLI, so the exec path remains the fallback. Verified to return output identical to the exec backend for the same call. Full rationale in [FORK.md](./FORK.md).
 
 ### Anti-Recursion Guard
 
