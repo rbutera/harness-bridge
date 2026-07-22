@@ -8,6 +8,7 @@ import { buildExplainCodePrompt, buildPlanPerfPrompt } from "./lib/prompt-builde
 import { createProgressReporter, logger, type ProgressReporter } from "./lib/logger.js";
 import { ThreadRegistry, type SandboxMode } from "./lib/thread-registry.js";
 import { Semaphore, resolveMaxConcurrent } from "./lib/semaphore.js";
+import { KeyedMutex } from "./lib/keyed-mutex.js";
 import { buildCodexArgs } from "./lib/codex-args.js";
 import { AppServerClient, isAppServerEnabled } from "./lib/app-server.js";
 import { CODEX_MODELS } from "./lib/types.js";
@@ -21,6 +22,13 @@ const threads = new ThreadRegistry();
 
 /** Caps concurrent `codex exec` subprocesses. See semaphore.ts. */
 const execSlots = new Semaphore(resolveMaxConcurrent());
+
+/**
+ * Serializes calls that share a `threadKey`, so resolve/run/remember is atomic
+ * per key. Acquired OUTSIDE `execSlots`; that ordering is fixed, and semaphore
+ * holders never take a key lock, so the two cannot deadlock. See keyed-mutex.ts.
+ */
+const keyLocks = new KeyedMutex();
 
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
 
@@ -169,6 +177,29 @@ async function runCodex(
 ): Promise<CodexResult> {
   // Default to read-only so an omitted sandbox is never an implicit escalation.
   const sandbox: SandboxMode = options.sandbox ?? "read-only";
+
+  // Resolving the key, running the turn, and recording the resulting thread is
+  // a read-modify-write. Without a per-key lock, two concurrent calls sharing a
+  // threadKey either start two threads and lose one (new key), or resume the
+  // same thread at once (existing key). Keyless calls — the default — skip the
+  // lock entirely and stay fully parallel.
+  const key = options.threadKey;
+  if (!key) return runCodexUnlocked(prompt, options, sandbox);
+  return keyLocks.run(key, () => runCodexUnlocked(prompt, options, sandbox));
+}
+
+async function runCodexUnlocked(
+  prompt: string,
+  options: {
+    workingDirectory?: string;
+    model?: string;
+    sandbox?: SandboxMode;
+    threadKey?: string;
+    fullAuto?: boolean;
+    progress?: ProgressReporter;
+  },
+  sandbox: SandboxMode,
+): Promise<CodexResult> {
   const resumeThreadId = threads.resolve(options.threadKey, sandbox);
 
   // Backend swap is invisible above this line: the MCP tool surface, and so
