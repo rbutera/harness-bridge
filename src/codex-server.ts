@@ -6,10 +6,54 @@ import { execCommand, resolveTimeoutMs, TIMEOUT_ENV_VAR } from "./lib/exec-runne
 import { parseCodexOutput } from "./lib/codex-output-parser.js";
 import { buildExplainCodePrompt, buildPlanPerfPrompt } from "./lib/prompt-builder.js";
 import { createProgressReporter, logger, type ProgressReporter } from "./lib/logger.js";
+import { ThreadRegistry, type SandboxMode } from "./lib/thread-registry.js";
+import { Semaphore, resolveMaxConcurrent } from "./lib/semaphore.js";
+import { buildCodexArgs } from "./lib/codex-args.js";
 import { CODEX_MODELS } from "./lib/types.js";
 import type { CodexResult } from "./lib/types.js";
 
-let lastThreadId: string | null = null;
+/**
+ * Thread continuity, keyed and sandbox-matched. Replaces the module-global
+ * `lastThreadId` that concurrent callers used to stomp. See thread-registry.ts.
+ */
+const threads = new ThreadRegistry();
+
+/** Caps concurrent `codex exec` subprocesses. See semaphore.ts. */
+const execSlots = new Semaphore(resolveMaxConcurrent());
+
+const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
+
+/**
+ * Shared description for the opt-in continuity key.
+ *
+ * Deliberately opt-in: the default of no key gives every call its own thread,
+ * which is what parallel reviewers want. Callers that genuinely need a
+ * multi-turn conversation pass a stable key of their own choosing.
+ */
+const THREAD_KEY_DESCRIPTION =
+  "Optional key enabling multi-turn continuity. Calls sharing a key resume the same Codex thread, " +
+  "provided the sandbox also matches. OMIT for independent one-shot calls (the default), which is " +
+  "what parallel reviews want — sharing a key across concurrent callers serialises them onto one thread.";
+
+/**
+ * Sandbox control for the read-oriented tools.
+ *
+ * These used to hardcode `read-only`, which meant a reviewer could not run a
+ * build or a test to check its own claims. It had to reason from source alone
+ * and then either guess or stall trying to run a command it was denied. Callers
+ * that want a reviewer to verify its findings can now grant `workspace-write`.
+ *
+ * The default stays `read-only`: analysis should not mutate a repo unless the
+ * caller explicitly asks, and an omitted argument must never be an escalation.
+ */
+const analysisSandboxSchema = z
+  .enum(SANDBOX_MODES)
+  .optional()
+  .default("read-only")
+  .describe(
+    "Sandbox level. Defaults to read-only. Pass workspace-write when the analysis should be able " +
+      "to run builds or tests to VERIFY its own findings rather than reasoning from source alone.",
+  );
 
 const server = new McpServer({ name: "codex-bridge", version: "0.1.0" });
 
@@ -57,51 +101,57 @@ async function runCodex(
   options: {
     workingDirectory?: string;
     model?: string;
-    sandbox?: string;
+    sandbox?: SandboxMode;
+    threadKey?: string;
     fullAuto?: boolean;
     progress?: ProgressReporter;
   } = {},
 ): Promise<CodexResult> {
-  let args: string[];
-  if (lastThreadId) {
-    // Resume an existing thread — --sandbox is not supported on resume
-    args = ["exec", "resume", lastThreadId, "--json"];
-    if (options.model) args.push("--model", options.model);
-    if (options.fullAuto) args.push("--full-auto");
-  } else {
-    args = ["exec", "--json"];
-    if (options.model) args.push("--model", options.model);
-    if (options.sandbox) args.push("--sandbox", options.sandbox);
-    if (options.fullAuto) args.push("--full-auto");
-  }
-  args.push(prompt);
+  // Default to read-only so an omitted sandbox is never an implicit escalation.
+  const sandbox: SandboxMode = options.sandbox ?? "read-only";
+  const resumeThreadId = threads.resolve(options.threadKey, sandbox);
 
+  const args = buildCodexArgs({
+    prompt,
+    resumeThreadId,
+    model: options.model,
+    sandbox,
+    fullAuto: options.fullAuto,
+  });
+
+  if (execSlots.available === 0) {
+    options.progress?.report(`Queued behind ${execSlots.waiting + 1} call(s)...`);
+  }
   options.progress?.report("Starting codex...");
 
   // Buffer for partial JSONL lines split across stdout chunks.
   let stdoutBuf = "";
 
-  const result = await execCommand({
-    command: "codex",
-    args,
-    cwd: options.workingDirectory,
-    onStdout: (chunk) => {
-      const text = chunk.toString();
+  // Bounded: N parallel reviewers must not spawn N unmanaged subprocesses,
+  // each able to hold a slot for the full exec timeout.
+  const result = await execSlots.run(() =>
+    execCommand({
+      command: "codex",
+      args,
+      cwd: options.workingDirectory,
+      onStdout: (chunk) => {
+        const text = chunk.toString();
 
-      // Parse streaming JSONL events for inline progress.
-      if (options.progress) {
-        stdoutBuf += text;
-        const lines = stdoutBuf.split(/\r?\n|\r/);
-        stdoutBuf = lines.pop()!;
-        for (const line of lines) {
-          reportCodexEvent(line, options.progress);
+        // Parse streaming JSONL events for inline progress.
+        if (options.progress) {
+          stdoutBuf += text;
+          const lines = stdoutBuf.split(/\r?\n|\r/);
+          stdoutBuf = lines.pop()!;
+          for (const line of lines) {
+            reportCodexEvent(line, options.progress);
+          }
         }
-      }
-    },
-    onStderr: (chunk) => {
-      logger.warn(`[codex:stderr] ${chunk.toString().replace(/\n$/, "")}`);
-    },
-  });
+      },
+      onStderr: (chunk) => {
+        logger.warn(`[codex:stderr] ${chunk.toString().replace(/\n$/, "")}`);
+      },
+    }),
+  );
 
   // Flush any remaining buffered JSONL fragment.
   if (options.progress && stdoutBuf.trim()) {
@@ -127,9 +177,17 @@ async function runCodex(
   options.progress?.report("Parsing response...");
   const parsed = parseCodexOutput(result.stdout);
 
+  // Only remember the thread when the caller opted into continuity with a key.
+  // Without a key this is a no-op, so concurrent callers cannot stomp each other.
   if (parsed.threadId) {
-    lastThreadId = parsed.threadId;
-    logger.debug(`Stored threadId for session continuity: ${parsed.threadId}`);
+    threads.remember(options.threadKey, parsed.threadId, sandbox);
+    if (options.threadKey) {
+      logger.debug(`Stored thread ${parsed.threadId} for key '${options.threadKey}' (${sandbox})`);
+    }
+  } else if (options.threadKey) {
+    // Codex returned no thread id, so a later resume under this key would target
+    // a stale thread. Drop it and let the next call start clean.
+    threads.forget(options.threadKey);
   }
 
   // Check stderr for API key issues
@@ -209,18 +267,20 @@ server.registerTool(
           "Override the Codex model. OMIT this unless explicitly told otherwise: when omitted, the Codex CLI uses the default from ~/.codex/config.toml, which is kept current. This enum may lag behind newly released models.",
         ),
       sandbox: z
-        .enum(["read-only", "workspace-write", "danger-full-access"])
+        .enum(SANDBOX_MODES)
         .optional()
         .default("read-only")
         .describe("Sandbox level controlling what Codex can modify"),
+      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
     },
   },
-  async ({ prompt, workingDirectory, model, sandbox }, extra) => {
+  async ({ prompt, workingDirectory, model, sandbox, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const parsed = await runCodex(prompt, {
       workingDirectory,
       model,
       sandbox,
+      threadKey,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -245,9 +305,11 @@ server.registerTool(
         .describe("Focus on: bugs, performance, style, security, etc."),
       context: z.string().optional().describe("Additional context about the codebase or changes"),
       workingDirectory: z.string().optional(),
+      sandbox: analysisSandboxSchema,
+      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
     },
   },
-  async ({ target, focusAreas, context, workingDirectory }, extra) => {
+  async ({ target, focusAreas, context, workingDirectory, sandbox, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     let prompt = `Review the following code changes. Provide specific, actionable feedback with line references.\n\nTarget: ${target}`;
     if (focusAreas) prompt += `\n\nFocus areas: ${focusAreas}`;
@@ -255,7 +317,8 @@ server.registerTool(
 
     const parsed = await runCodex(prompt, {
       workingDirectory,
-      sandbox: "read-only",
+      sandbox,
+      threadKey,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -276,9 +339,11 @@ server.registerTool(
         .optional()
         .describe("Known constraints: timeline, tech stack, compatibility"),
       workingDirectory: z.string().optional(),
+      sandbox: analysisSandboxSchema,
+      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
     },
   },
-  async ({ plan, codebasePath, constraints, workingDirectory }, extra) => {
+  async ({ plan, codebasePath, constraints, workingDirectory, sandbox, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     let prompt = `Critique this implementation plan. Identify gaps, risks, missing edge cases, and suggest improvements.\n\nPlan:\n${plan}`;
     if (codebasePath) prompt += `\n\nRelevant codebase: ${codebasePath}`;
@@ -286,7 +351,8 @@ server.registerTool(
 
     const parsed = await runCodex(prompt, {
       workingDirectory,
-      sandbox: "read-only",
+      sandbox,
+      threadKey,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -310,14 +376,17 @@ server.registerTool(
         .describe("Depth of explanation: overview, detailed, or full execution trace"),
       context: z.string().optional().describe("Additional context about the codebase"),
       workingDirectory: z.string().optional(),
+      sandbox: analysisSandboxSchema,
+      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
     },
   },
-  async ({ target, depth, context, workingDirectory }, extra) => {
+  async ({ target, depth, context, workingDirectory, sandbox, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const prompt = buildExplainCodePrompt({ target, depth, context });
     const parsed = await runCodex(prompt, {
       workingDirectory,
-      sandbox: "read-only",
+      sandbox,
+      threadKey,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -342,14 +411,20 @@ server.registerTool(
         .describe("Constraints: must not increase binary size, etc."),
       context: z.string().optional().describe("Additional context about usage patterns"),
       workingDirectory: z.string().optional(),
+      sandbox: analysisSandboxSchema,
+      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
     },
   },
-  async ({ target, metrics, constraints, context, workingDirectory }, extra) => {
+  async (
+    { target, metrics, constraints, context, workingDirectory, sandbox, threadKey },
+    extra,
+  ) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const prompt = buildPlanPerfPrompt({ target, metrics, constraints, context });
     const parsed = await runCodex(prompt, {
       workingDirectory,
-      sandbox: "read-only",
+      sandbox,
+      threadKey,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -375,15 +450,22 @@ server.registerTool(
         .enum(["workspace-write", "danger-full-access"])
         .optional()
         .default("workspace-write")
-        .describe("Sandbox level (must allow writes)"),
+        .describe(
+          "Sandbox level (must allow writes). NOTE: workspace-write excludes a git worktree's " +
+            "real .git directory, which lives at <main-repo>/.git/worktrees/<name>. Inside a " +
+            "worktree it blocks commits and blocks test hosts that need to write outside the " +
+            "workspace, so use danger-full-access there.",
+        ),
+      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
     },
   },
-  async ({ task, workingDirectory, model, sandbox }, extra) => {
+  async ({ task, workingDirectory, model, sandbox, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const parsed = await runCodex(task, {
       workingDirectory,
       model,
       sandbox,
+      threadKey,
       fullAuto: true,
       progress,
     });
