@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { KeyedMutex } from "../src/lib/keyed-mutex.js";
-import { ThreadRegistry } from "../src/lib/thread-registry.js";
+import { SessionRegistry } from "../src/lib/session-registry.js";
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void;
@@ -150,24 +150,24 @@ describe("keyed continuity under concurrency (the race this fixes)", () => {
    * record the thread. Without a lock these interleave.
    */
   async function call(
-    registry: ThreadRegistry,
+    registry: SessionRegistry,
     key: string,
     newThreadId: string,
     mutex?: KeyedMutex,
   ) {
     const body = async () => {
-      const resumed = registry.resolve(key, "read-only");
+      const resumed = registry.resolve(key);
       // Yield, standing in for the real `codex exec` await.
       await new Promise((r) => setTimeout(r, 0));
       const threadId = resumed ?? newThreadId;
-      registry.remember(key, threadId, "read-only");
+      registry.remember(key, threadId);
       return { resumed, threadId };
     };
     return mutex ? mutex.run(key, body) : body();
   }
 
   it("WITHOUT a lock, two calls on one key both start a thread and one is lost", async () => {
-    const registry = new ThreadRegistry();
+    const registry = new SessionRegistry();
     const [a, b] = await Promise.all([
       call(registry, "shared", "thread-A"),
       call(registry, "shared", "thread-B"),
@@ -178,11 +178,11 @@ describe("keyed continuity under concurrency (the race this fixes)", () => {
     expect(b.resumed).toBeNull();
     expect(a.threadId).not.toBe(b.threadId);
     // Only one survives; the other conversation is orphaned.
-    expect(registry.resolve("shared", "read-only")).toBe("thread-B");
+    expect(registry.resolve("shared")).toBe("thread-B");
   });
 
   it("WITH the lock, the second call resumes the first call's thread", async () => {
-    const registry = new ThreadRegistry();
+    const registry = new SessionRegistry();
     const mutex = new KeyedMutex();
     const [a, b] = await Promise.all([
       call(registry, "shared", "thread-A", mutex),
@@ -194,6 +194,6 @@ describe("keyed continuity under concurrency (the race this fixes)", () => {
     // The whole point: the second call sees the first's write and continues it.
     expect(b.resumed).toBe("thread-A");
     expect(b.threadId).toBe("thread-A");
-    expect(registry.resolve("shared", "read-only")).toBe("thread-A");
+    expect(registry.resolve("shared")).toBe("thread-A");
   });
 });

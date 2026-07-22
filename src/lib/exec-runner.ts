@@ -4,17 +4,24 @@ import { logger } from "./logger.js";
 import type { ExecOptions, ExecResult } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 1_800_000; // 30 minutes
-const MAX_BRIDGE_DEPTH = 2;
+const MAX_HARNESS_DEPTH = 2;
 const DEFAULT_MAX_RETRIES = 2;
 const MAX_RETRY_DELAY_MS = 10_000;
 
 // Documented knob for the per-call exec timeout. Long reviews (e.g. a multi-doc
 // codex_review_plan) legitimately run for many minutes; raise this if needed.
-export const TIMEOUT_ENV_VAR = "CODEX_BRIDGE_TIMEOUT_MS";
+export const TIMEOUT_ENV_VAR = "HARNESS_BRIDGE_TIMEOUT_MS";
+export const RETRIES_ENV_VAR = "HARNESS_BRIDGE_MAX_RETRIES";
+export const DEPTH_ENV_VAR = "HARNESS_BRIDGE_DEPTH";
+
+const LEGACY_TIMEOUT_ENV_VARS = ["CODEX_BRIDGE_TIMEOUT_MS", "BRIDGE_TIMEOUT_MS"] as const;
+const LEGACY_RETRIES_ENV_VAR = "BRIDGE_MAX_RETRIES";
+const LEGACY_DEPTH_ENV_VAR = "BRIDGE_DEPTH";
 
 export function resolveTimeoutMs(): number {
-  // BRIDGE_TIMEOUT_MS is the legacy name, kept for back-compat.
-  const env = process.env[TIMEOUT_ENV_VAR] ?? process.env["BRIDGE_TIMEOUT_MS"];
+  const env =
+    process.env[TIMEOUT_ENV_VAR] ??
+    LEGACY_TIMEOUT_ENV_VARS.map((name) => process.env[name]).find(Boolean);
   if (env) {
     const parsed = parseInt(env, 10);
     if (!Number.isNaN(parsed) && parsed > 0) return parsed;
@@ -23,7 +30,7 @@ export function resolveTimeoutMs(): number {
 }
 
 function getMaxRetries(): number {
-  const env = process.env["BRIDGE_MAX_RETRIES"];
+  const env = process.env[RETRIES_ENV_VAR] ?? process.env[LEGACY_RETRIES_ENV_VAR];
   if (env) {
     const parsed = parseInt(env, 10);
     if (!Number.isNaN(parsed) && parsed >= 0) return parsed;
@@ -31,11 +38,18 @@ function getMaxRetries(): number {
   return DEFAULT_MAX_RETRIES;
 }
 
+function resolveRecursionDepth(): number {
+  const values = [process.env[DEPTH_ENV_VAR], process.env[LEGACY_DEPTH_ENV_VAR]]
+    .map((value) => parseInt(value ?? "0", 10))
+    .filter((value) => Number.isFinite(value));
+  return Math.max(0, ...values);
+}
+
 function checkRecursionDepth(): void {
-  const depth = parseInt(process.env["BRIDGE_DEPTH"] ?? "0", 10);
-  if (depth >= MAX_BRIDGE_DEPTH) {
+  const depth = resolveRecursionDepth();
+  if (depth >= MAX_HARNESS_DEPTH) {
     throw new BridgeError(
-      `Maximum bridge nesting depth reached (${depth} >= ${MAX_BRIDGE_DEPTH}). This prevents infinite recursion between Claude and Codex.`,
+      `Maximum harness nesting depth reached (${depth} >= ${MAX_HARNESS_DEPTH}).`,
       "RECURSION_LIMIT",
     );
   }
@@ -88,12 +102,13 @@ function sleep(ms: number): Promise<void> {
 
 function execOnce(options: ExecOptions): Promise<ExecResult> {
   const timeoutMs = options.timeoutMs ?? resolveTimeoutMs();
-  const currentDepth = parseInt(process.env["BRIDGE_DEPTH"] ?? "0", 10);
+  const currentDepth = resolveRecursionDepth();
 
   const env: Record<string, string | undefined> = {
     ...process.env,
     ...options.env,
-    BRIDGE_DEPTH: String(currentDepth + 1),
+    [DEPTH_ENV_VAR]: String(currentDepth + 1),
+    [LEGACY_DEPTH_ENV_VAR]: String(currentDepth + 1),
   };
 
   return new Promise((resolve, reject) => {

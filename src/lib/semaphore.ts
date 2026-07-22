@@ -4,13 +4,14 @@
  * Without a cap, N parallel reviewers spawn N unmanaged subprocesses, each able
  * to hold a slot for the full exec timeout. That is the resource half of the
  * "bridge is saturated" report; the correctness half is the shared thread
- * pointer, fixed separately in `thread-registry.ts`.
+ * pointer, fixed separately by keyed session isolation.
  *
  * Waiters are served strictly FIFO, so a burst of reviewers cannot starve an
  * earlier caller.
  */
 
-export const CONCURRENCY_ENV_VAR = "CODEX_BRIDGE_MAX_CONCURRENT";
+export const CONCURRENCY_ENV_VAR = "HARNESS_BRIDGE_CODEX_MAX_CONCURRENT";
+export const LEGACY_CONCURRENCY_ENV_VAR = "CODEX_BRIDGE_MAX_CONCURRENT";
 
 /** Default in-flight cap. Chosen to keep a dual-review gate fully parallel. */
 export const DEFAULT_MAX_CONCURRENT = 4;
@@ -25,7 +26,7 @@ export const DEFAULT_MAX_CONCURRENT = 4;
 export function resolveMaxConcurrent(
   env: Record<string, string | undefined> = process.env,
 ): number {
-  const raw = env[CONCURRENCY_ENV_VAR];
+  const raw = env[CONCURRENCY_ENV_VAR] ?? env[LEGACY_CONCURRENCY_ENV_VAR];
   if (!raw) return DEFAULT_MAX_CONCURRENT;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_CONCURRENT;

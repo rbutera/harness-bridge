@@ -12,12 +12,12 @@ import {
 export default defineCommand({
   meta: {
     name: "setup",
-    description: "Set up claude-codex-bridge for Claude Code and/or Codex CLI",
+    description: "Set up all supported Harness Bridge routes and extras",
   },
   args: {
     target: {
       type: "positional",
-      description: "Target to set up: claude, codex, or both",
+      description: "Calling harness to configure: claude, codex, or both",
       required: false,
     },
     global: { type: "boolean", description: "Install extras globally" },

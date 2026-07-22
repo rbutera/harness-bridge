@@ -1,39 +1,52 @@
 {
-  "name": "claude-codex-bridge",
-  "version": "0.3.1",
-  "description": "Bidirectional MCP server bridge between Claude Code and Codex CLI",
+  "name": "harness-bridge",
+  "version": "0.4.0",
+  "description": "Cross-harness MCP connector for coding agents",
   "keywords": [
     "ai",
-    "bridge",
     "claude",
     "codex",
+    "connector",
+    "harness",
     "mcp"
   ],
-  "homepage": "https://github.com/Dunqing/claude-codex-bridge#readme",
+  "homepage": "https://github.com/rbutera/harness-bridge#readme",
   "bugs": {
-    "url": "https://github.com/Dunqing/claude-codex-bridge/issues"
+    "url": "https://github.com/rbutera/harness-bridge/issues"
   },
   "license": "MIT",
-  "author": "Dunqing <dengqing0821@gmail.com>",
+  "author": "Rai Butera <rai@rbutera.com>",
+  "contributors": [
+    {
+      "name": "Dunqing",
+      "email": "dengqing0821@gmail.com"
+    }
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Dunqing/claude-codex-bridge.git"
-  },
-  "funding": {
-    "type": "github",
-    "url": "https://github.com/sponsors/Dunqing"
+    "url": "git+https://github.com/rbutera/harness-bridge.git"
   },
   "bin": {
-    "ccb-claude": "./dist/claude-server.mjs",
-    "ccb-codex": "./dist/codex-server.mjs",
-    "claude-codex-bridge": "./dist/cli.mjs"
+    "ccb-claude": "dist/claude-server.mjs",
+    "ccb-codex": "dist/codex-server.mjs",
+    "claude-codex-bridge": "dist/cli.mjs",
+    "harness-bridge": "dist/cli.mjs",
+    "hb-claude": "dist/claude-server.mjs",
+    "hb-codex": "dist/codex-server.mjs"
   },
   "files": [
     "dist",
     "agents",
-    "skills"
+    "skills",
+    "CHANGELOG.md",
+    "MIGRATION.md",
+    "ORIGIN.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsdown",
     "dev:codex-server": "tsx src/codex-server.ts",
@@ -44,19 +57,18 @@
     "fmt": "oxfmt .",
     "fmt:check": "oxfmt --check src/ test/",
     "publint": "publint",
-    "prepublishOnly": "pnpm build",
+    "check": "pnpm fmt:check && pnpm lint && pnpm test && pnpm build && pnpm publint",
+    "prepublishOnly": "pnpm check",
     "release": "bumpp",
     "prepare": "husky"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "citty": "^0.2.0",
-    "consola": "^3.4.2",
-    "zod": "^4.3.6"
-  },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^25.2.3",
     "bumpp": "^10.4.1",
+    "citty": "^0.2.0",
+    "consola": "^3.4.2",
+    "fast-uri": "^3.1.4",
     "husky": "^9.1.7",
     "oxfmt": "^0.28.0",
     "oxlint": "^1.43.0",
@@ -64,7 +76,8 @@
     "tsdown": "^0.20.3",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.18"
+    "vitest": "^4.0.18",
+    "zod": "^4.3.6"
   },
   "engines": {
     "node": ">=18"
