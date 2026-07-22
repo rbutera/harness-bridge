@@ -28,6 +28,7 @@ Pick the best tool based on the user's request:
 4. Always pass `workingDirectory` to every tool call
 5. Synthesize the response: summarize key findings, highlight important points, give actionable recommendations
 6. Only use `codex_implement` if the user explicitly asks Codex to make changes
+7. Do not pass a sandbox argument; Harness Bridge always runs Codex unrestricted
 
 ## Examples
 

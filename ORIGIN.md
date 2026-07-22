@@ -1,29 +1,29 @@
-# Fork notes — `rbutera/claude-codex-bridge`
+# Origin and lineage
 
-What this fork changes versus upstream [`Dunqing/claude-codex-bridge`](https://github.com/Dunqing/claude-codex-bridge), and why.
+Harness Bridge began from [`Dunqing/claude-codex-bridge`](https://github.com/Dunqing/claude-codex-bridge). The original commit history, authorship, and MIT copyright notice are preserved.
 
-Upstream is at `v0.3.1` and has been unmaintained since February 2026.
+The project diverged after upstream v0.3.1, initially as `rbutera/claude-codex-bridge`, then became the standalone `harness-bridge` project at v0.4.0. This document preserves the technical record of the pre-v0.4.0 divergence. File paths, environment variables, and product names below describe that historical state and may differ from the current implementation.
 
 ---
 
 ## TL;DR
 
-| | Upstream v0.3.1 | This fork |
-|---|---|---|
-| Commits ahead | — | 6 |
-| `src/` lines | 1,723 | 2,596 (+51%) |
-| Test files / cases | 5 | 12 / 113 |
-| New source modules | — | 7 |
-| Concurrency model | one global thread pointer | per-key thread isolation + per-key serialization + bounded pool |
-| Sandbox on analysis tools | hardcoded `read-only` | caller-controlled, defaults `read-only` |
-| Sandbox on resume | silently dropped | matched, or a fresh thread |
-| Backends | `codex exec` only | `codex exec` (default) + `codex app-server` (opt-in) |
+|                           | Upstream v0.3.1           | This fork                                                       |
+| ------------------------- | ------------------------- | --------------------------------------------------------------- |
+| Commits ahead             | —                         | 8                                                               |
+| `src/` lines              | 1,723                     | 2,596 (+51%)                                                    |
+| Test files / cases        | 5                         | 12 / 113                                                        |
+| New source modules        | —                         | 7                                                               |
+| Concurrency model         | one global thread pointer | per-key thread isolation + per-key serialization + bounded pool |
+| Sandbox on analysis tools | hardcoded `read-only`     | caller-controlled, defaults `read-only`                         |
+| Sandbox on resume         | silently dropped          | matched, or a fresh thread                                      |
+| Backends                  | `codex exec` only         | `codex exec` (default) + `codex app-server` (opt-in)            |
 
 Diff: `+1830 / -59` across 21 files. The reverse leg (`src/claude-server.ts`, Codex→Claude) is **untouched** — every change is on the Claude→Codex side.
 
 ---
 
-## Why the fork exists
+## Why the continuation exists
 
 The bridge was reported "saturated" under concurrent review load: a `/wave` run fires an Opus reviewer and a Codex reviewer in parallel, per wave, sometimes across several worktrees at once. That workload broke it.
 
@@ -54,7 +54,7 @@ Concurrent callers can no longer see each other's threads at all.
 
 Caught by an independent Codex review of the fix above, which is the point of having one.
 
-Killing the global made *implicit* sharing impossible but left *explicit* sharing unsafe. Resolving a key, running the turn, and recording the resulting thread is a read-modify-write, and it was not atomic. Two concurrent calls on one `threadKey`:
+Killing the global made _implicit_ sharing impossible but left _explicit_ sharing unsafe. Resolving a key, running the turn, and recording the resulting thread is a read-modify-write, and it was not atomic. Two concurrent calls on one `threadKey`:
 
 - **New key:** both resolve to `null`, both start their own thread, both write the registry. One thread id is lost and its conversation orphaned — the continuity the caller asked for silently did not happen.
 - **Existing key:** both resolve the same id and both `codex exec resume` it at once. The original interleaving bug, scoped to a key.
@@ -94,7 +94,7 @@ Because the global was set after the first call, **every subsequent call resumed
 ```ts
 const parsed = await runCodex(prompt, {
   workingDirectory,
-  sandbox: "read-only",   // codex_review_code / review_plan / explain_code / plan_perf
+  sandbox: "read-only", // codex_review_code / review_plan / explain_code / plan_perf
   progress,
 });
 ```
@@ -121,15 +121,15 @@ Enable with `CODEX_BRIDGE_BACKEND=app-server`. **The repo default is still `exec
 
 The exec transport has limits that are structural rather than things care can work around. `codex app-server` is a JSON-RPC service where threads are first-class:
 
-| | `codex exec` | `codex app-server` |
-|---|---|---|
-| Sandbox on resume | flag does not exist | `thread/resume` **and** per-turn `turn/start` both accept one |
-| Worktree writes | `workspace-write` grants only the cwd, so the only escape is `danger-full-access` | `SandboxPolicy.workspaceWrite.writableRoots` grants exactly the paths needed |
-| Cancellation | none; a wedged call holds its slot for the whole timeout | `turn/interrupt` |
-| Event stream | parse JSONL out of stdout with a hand-rolled line buffer | typed notifications |
-| Process cost | one CLI spawn per call | one persistent server |
+|                   | `codex exec`                                                                      | `codex app-server`                                                           |
+| ----------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Sandbox on resume | flag does not exist                                                               | `thread/resume` **and** per-turn `turn/start` both accept one                |
+| Worktree writes   | `workspace-write` grants only the cwd, so the only escape is `danger-full-access` | `SandboxPolicy.workspaceWrite.writableRoots` grants exactly the paths needed |
+| Cancellation      | none; a wedged call holds its slot for the whole timeout                          | `turn/interrupt`                                                             |
+| Event stream      | parse JSONL out of stdout with a hand-rolled line buffer                          | typed notifications                                                          |
+| Process cost      | one CLI spawn per call                                                            | one persistent server                                                        |
 
-The `writableRoots` capability is the standout. A git worktree's `.git` is a *file* pointing at `<main-repo>/.git/worktrees/<name>`, outside the workspace — which is why `workspace-write` blocks commits there and the only workaround was dropping the sandbox entirely. The app-server can grant precisely that one directory. Least privilege becomes available for the first time.
+The `writableRoots` capability is the standout. A git worktree's `.git` is a _file_ pointing at `<main-repo>/.git/worktrees/<name>`, outside the workspace — which is why `workspace-write` blocks commits there and the only workaround was dropping the sandbox entirely. The app-server can grant precisely that one directory. Least privilege becomes available for the first time.
 
 The protocol is machine-describable (`codex app-server generate-ts`, `generate-json-schema`), which materially de-risks its `[experimental]` label: a client can be pinned against a generated schema.
 
@@ -145,7 +145,7 @@ The protocol is machine-describable (`codex app-server generate-ts`, `generate-j
 
 Every guard added here was **mutation-tested**: broken on purpose, and the suite confirmed to turn red. A test that has never failed has not been shown to test anything.
 
-That process earned its keep. The first battery found that the keyless guards in `ThreadRegistry.resolve` and `.remember` were not *independently* pinned — a regression touching only one of them would have passed. Two dedicated tests now cover that.
+That process earned its keep. The first battery found that the keyless guards in `ThreadRegistry.resolve` and `.remember` were not _independently_ pinned — a regression touching only one of them would have passed. Two dedicated tests now cover that.
 
 The app-server backend was verified against real Codex rather than only compiled:
 
@@ -158,15 +158,15 @@ The app-server backend was verified against real Codex rather than only compiled
 
 **New:**
 
-| File | Purpose |
-|---|---|
-| `src/lib/thread-registry.ts` | Keyed, sandbox-matched thread continuity. Replaces the global. |
-| `src/lib/semaphore.ts` | FIFO-fair bounded concurrency for `codex exec`. |
-| `src/lib/keyed-mutex.ts` | Serializes calls sharing a `threadKey`, making resolve/run/remember atomic. |
-| `src/lib/codex-args.ts` | Builds `codex` argv. Separate from the server so tests can import it without the server's top-level `main()` starting a real stdio process. |
-| `src/lib/app-server.ts` | JSON-RPC client for `codex app-server`. |
-| `src/lib/jsonrpc.ts` | Newline-delimited JSON-RPC framing. |
-| `src/lib/sandbox-policy.ts` | Sandbox mode → app-server `SandboxPolicy`, incl. `writableRoots`. |
+| File                         | Purpose                                                                                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib/thread-registry.ts` | Keyed, sandbox-matched thread continuity. Replaces the global.                                                                              |
+| `src/lib/semaphore.ts`       | FIFO-fair bounded concurrency for `codex exec`.                                                                                             |
+| `src/lib/keyed-mutex.ts`     | Serializes calls sharing a `threadKey`, making resolve/run/remember atomic.                                                                 |
+| `src/lib/codex-args.ts`      | Builds `codex` argv. Separate from the server so tests can import it without the server's top-level `main()` starting a real stdio process. |
+| `src/lib/app-server.ts`      | JSON-RPC client for `codex app-server`.                                                                                                     |
+| `src/lib/jsonrpc.ts`         | Newline-delimited JSON-RPC framing.                                                                                                         |
+| `src/lib/sandbox-policy.ts`  | Sandbox mode → app-server `SandboxPolicy`, incl. `writableRoots`.                                                                           |
 
 **Modified:** `src/codex-server.ts` (the three defects, plus backend dispatch), `src/lib/types.ts` and `src/lib/exec-runner.ts` (model enum + timeout, from the earlier commits).
 

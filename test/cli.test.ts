@@ -17,6 +17,7 @@ describe("cli", () => {
     expect(result.exitCode).not.toBe(0);
     const output = result.stdout + result.stderr;
     expect(output).toContain("serve");
+    expect(output).toContain("connect");
     expect(output).toContain("setup");
     expect(output).toContain("install");
   });
@@ -31,12 +32,12 @@ describe("cli", () => {
     const result = await runCli(["serve", "codex"]);
     // The server starts on stdio and blocks waiting for input,
     // so it will be killed by timeout. Check that it started successfully.
-    expect(result.stderr).toContain("codex-bridge MCP server started");
+    expect(result.stderr).toContain("harness-bridge codex adapter started");
   });
 
   it("starts claude server on 'serve claude'", async () => {
     const result = await runCli(["serve", "claude"]);
-    expect(result.stderr).toContain("claude-bridge MCP server started");
+    expect(result.stderr).toContain("harness-bridge claude adapter started");
   });
 
   it("shows serve help with codex and claude subcommands", async () => {
@@ -49,5 +50,11 @@ describe("cli", () => {
     const result = await runCli(["install", "--help"]);
     expect(result.stdout).toContain("skill");
     expect(result.stdout).toContain("agent");
+  });
+
+  it("rejects unsupported harness routes", async () => {
+    const result = await runCli(["connect", "claude", "--to", "claude"]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("Unsupported route: claude -> claude");
   });
 });

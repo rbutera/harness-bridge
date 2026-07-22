@@ -5,5 +5,7 @@ export default defineConfig({
   format: "esm",
   dts: true,
   clean: true,
+  inlineOnly: false,
+  noExternal: [/.*/],
   publint: true,
 });

@@ -1,68 +1,68 @@
-# claude-codex-bridge
+# Harness Bridge
 
-[![npm version](https://img.shields.io/npm/v/claude-codex-bridge?color=f97316)](https://www.npmjs.com/package/claude-codex-bridge)
-[![npm downloads](https://img.shields.io/npm/dm/claude-codex-bridge?color=3b82f6)](https://www.npmjs.com/package/claude-codex-bridge)
+[![npm version](https://img.shields.io/npm/v/harness-bridge?color=f97316)](https://www.npmjs.com/package/harness-bridge)
+[![CI](https://github.com/rbutera/harness-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/rbutera/harness-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
 
-Bidirectional [MCP](https://modelcontextprotocol.io/) server bridge between **Claude Code** and **OpenAI Codex CLI**.
+Harness Bridge connects coding-agent harnesses through MCP so one harness can query, review, explain, and delegate implementation work to another.
 
-Let Claude and Codex work as partners — each can ask the other for help, review code, explain logic, and plan performance improvements.
+It currently ships two adapters:
 
-> [!NOTE]
-> **This is a fork** of [`Dunqing/claude-codex-bridge`](https://github.com/Dunqing/claude-codex-bridge) (unmaintained since Feb 2026), rebuilt to survive concurrent use. Upstream ran every concurrent call through a single shared thread pointer, silently dropped `--sandbox` on resume, and hardcoded its analysis tools to `read-only` so a reviewer could not run the tests that would verify its own findings.
->
-> **See [FORK.md](./FORK.md) for the full breakdown.** Short version, all covered below: per-key thread isolation, sandbox-matched resume, caller-controlled sandboxes, bounded concurrency, and an opt-in `codex app-server` backend.
+| Calling harness | Connected harness | MCP tools  |
+| --------------- | ----------------- | ---------- |
+| Claude Code     | OpenAI Codex      | `codex_*`  |
+| OpenAI Codex    | Claude Code       | `claude_*` |
 
-```
-┌──────────────┐         MCP          ┌──────────────┐
-│              │ ◄──────────────────► │              │
-│  Claude Code │    claude-codex      │  Codex CLI   │
-│              │ ◄───── bridge ─────► │              │
-└──────────────┘                      └──────────────┘
-```
+The adapter boundary keeps harness-specific execution, sessions, models, and capabilities separate while preserving a consistent set of task-oriented MCP tools.
+
+## Execution contract
+
+> [!WARNING]
+> Every Claude-to-Codex call runs Codex without approvals or sandboxing. The exec backend always uses `--dangerously-bypass-approvals-and-sandbox`; the app-server backend always uses `dangerFullAccess`. The `codex_*` MCP tools expose no sandbox argument, so callers cannot change this policy.
+
+Only connect Harness Bridge to projects and harnesses you trust with the permissions of your user account.
 
 ## Prerequisites
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — installed and authenticated
-- [Codex CLI](https://developers.openai.com/codex/cli/) — installed and authenticated
-- [Node.js](https://nodejs.org) >= 18
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), installed and authenticated
+- [OpenAI Codex CLI](https://developers.openai.com/codex/cli/), installed and authenticated
+- Node.js 18 or newer
 
-## Quick Start
+## Quick start
 
-Set up everything with a single command:
-
-```bash
-npx claude-codex-bridge setup
-```
-
-This registers MCP servers for both Claude Code and Codex, and installs the `/codex` skill and codex-teammate agent.
-
-## Setup
-
-### Automatic (recommended)
+Configure both routes and install the bundled skills and Codex teammate agent:
 
 ```bash
-npx claude-codex-bridge setup              # Full setup: both directions + skill + agent
-npx claude-codex-bridge setup claude       # Only Claude Code → Codex
-npx claude-codex-bridge setup codex        # Only Codex → Claude
-npx claude-codex-bridge setup --skip-extras  # MCP servers only, no skill/agent
+npx harness-bridge setup
 ```
 
-Use `--global` or `--local` to control where the skill and agent are installed (defaults to interactive prompt).
-
-### Manual
-
-<details>
-<summary><strong>Claude Code → Codex</strong> (let Claude call Codex)</summary>
-
-Add to your Claude Code MCP config:
+Configure one route without installing extras:
 
 ```bash
-claude mcp add codex -s user -- npx claude-codex-bridge serve codex
+npx harness-bridge connect claude --to codex
+npx harness-bridge connect codex --to claude
 ```
 
-Or add to `.mcp.json` in your project:
+The compatibility forms remain available:
+
+```bash
+npx harness-bridge setup claude
+npx harness-bridge setup codex
+npx harness-bridge setup --skip-extras
+```
+
+`setup claude` means “configure Claude Code as the calling harness”; `setup codex` configures Codex as the caller.
+
+## Manual configuration
+
+### Claude Code calls Codex
+
+```bash
+claude mcp add codex -s user -- npx harness-bridge serve codex
+```
+
+Project-local `.mcp.json`:
 
 ```json
 {
@@ -70,221 +70,100 @@ Or add to `.mcp.json` in your project:
     "codex": {
       "type": "stdio",
       "command": "npx",
-      "args": ["claude-codex-bridge", "serve", "codex"]
+      "args": ["harness-bridge", "serve", "codex"]
     }
   }
 }
 ```
 
-</details>
+### Codex calls Claude Code
 
-<details>
-<summary><strong>Codex → Claude</strong> (let Codex call Claude)</summary>
-
-Add to `~/.codex/config.toml`:
+Add this to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.claude]
 command = "npx"
-args = ["claude-codex-bridge", "serve", "claude"]
+args = ["harness-bridge", "serve", "claude"]
 tool_timeout_sec = 600
-```
-
-</details>
-
-## Usage
-
-Once set up, just talk to Claude Code or Codex naturally. The bridge tools are picked up automatically.
-
-### In Claude Code — ask Codex for help
-
-```
-> Ask Codex to review my recent changes
-
-> Get Codex's opinion on whether this approach is correct: [paste plan]
-
-> Have Codex explain how the parser in src/lib/codex-output-parser.ts works
-
-> Ask Codex to analyze performance bottlenecks in the exec runner
-
-> Ask Codex to implement error handling for the retry logic
-```
-
-### In Codex — ask Claude for help
-
-```
-> Ask Claude to review the changes in HEAD~3..HEAD
-
-> Have Claude explain the architecture of this project
-
-> Ask Claude to critique my plan for adding caching
-```
-
-### Using the `/codex` slash command (Claude Code)
-
-Install the skill to get the `/codex` shortcut in Claude Code:
-
-```bash
-npx claude-codex-bridge install skill claude --global    # or --local
-```
-
-Then use it:
-
-```
-/codex review my recent changes
-/codex explain src/lib/exec-runner.ts
-/codex is my approach to caching correct?
-/codex optimize the output parser for memory usage
-```
-
-### Using the `/claude` slash command (Codex)
-
-Install the skill to get the `/claude` shortcut in Codex:
-
-```bash
-npx claude-codex-bridge install skill codex --global    # or --local
-```
-
-Then use it:
-
-```
-/claude review my recent changes
-/claude explain the architecture of this project
-/claude critique my plan for adding caching
-```
-
-### Spawning Codex as a teammate
-
-For parallel work, spawn Codex as a subagent from Claude Code:
-
-```
-> Spawn a codex-teammate to review src/lib/exec-runner.ts while we keep working
 ```
 
 ## Tools
 
-### `ccb-codex` — Claude calls Codex
+Each adapter exposes the same task categories with a harness-specific prefix:
 
-| Tool                 | Description                                      |
-| -------------------- | ------------------------------------------------ |
-| `codex_query`        | Ask Codex a question or give it a task           |
-| `codex_review_code`  | Ask Codex to review code changes                 |
-| `codex_review_plan`  | Ask Codex to critique an implementation plan     |
-| `codex_explain_code` | Ask Codex to explain code / logic / architecture |
-| `codex_plan_perf`    | Ask Codex to plan performance improvements       |
-| `codex_implement`    | Ask Codex to write or modify code                |
+| Task                 | Codex tool           | Claude tool           |
+| -------------------- | -------------------- | --------------------- |
+| General query        | `codex_query`        | `claude_query`        |
+| Code review          | `codex_review_code`  | `claude_review_code`  |
+| Plan review          | `codex_review_plan`  | `claude_review_plan`  |
+| Code explanation     | `codex_explain_code` | `claude_explain_code` |
+| Performance planning | `codex_plan_perf`    | `claude_plan_perf`    |
+| Implementation       | `codex_implement`    | `claude_implement`    |
 
-#### Shared arguments (fork additions)
+All tools accept `workingDirectory`. Both adapters also accept an optional `threadKey` for deliberate multi-turn continuity:
 
-Every `codex_*` tool also accepts these. Both are the point of the fork; see [FORK.md](./FORK.md).
+- Omit `threadKey` for independent calls. This is the concurrency-safe default.
+- Reuse a stable key to continue one conversation.
+- Calls sharing a key are serialized; different keys and keyless calls remain independent.
 
-**`sandbox`** — `read-only` | `workspace-write` | `danger-full-access`
+For Codex, omit `model` unless a specific override is required so the current default from `~/.codex/config.toml` applies.
 
-Analysis tools default to `read-only`; `codex_implement` defaults to `workspace-write`. Upstream hardcoded the analysis tools, so a reviewer could never run the build or tests that would confirm its own findings.
+## Bundled skills and agent
 
-- Pass `workspace-write` to a reviewer that should **verify** rather than infer.
-- Inside a **git worktree**, implementation needs `danger-full-access`. A worktree's `.git` is a file pointing at `<main-repo>/.git/worktrees/<name>`, outside the workspace, so `workspace-write` blocks commits and breaks test hosts that write outside the tree. (The opt-in app-server backend can instead grant just that directory via `writableRoots`.)
+`setup` can install:
 
-**`threadKey`** — optional string, **omit by default**
+- a `/codex` skill for Claude Code
+- a `codex-teammate` agent for Claude Code
+- a `/claude` skill for Codex-compatible agent directories
 
-Without it every call gets its own Codex thread, which is what keeps parallel reviewers independent. Pass one only for a deliberate multi-turn conversation, and never share a key across calls running at the same time.
-
-Because `codex exec resume` accepts no `--sandbox`, a resumed thread keeps the sandbox it was created with. Asking for a different sandbox under the same key therefore starts a **fresh** thread rather than silently running under the wrong one.
-
-> [!TIP]
-> **Never pass `model`.** Omit it so the `~/.codex/config.toml` default applies. The enum here can lag behind newly released models, and picking from it silently downgrades the result.
-
-### `ccb-claude` — Codex calls Claude
-
-| Tool                  | Description                                       |
-| --------------------- | ------------------------------------------------- |
-| `claude_query`        | Ask Claude a question or give it a task           |
-| `claude_review_code`  | Ask Claude to review code changes                 |
-| `claude_review_plan`  | Ask Claude to critique an implementation plan     |
-| `claude_explain_code` | Ask Claude to explain code / logic / architecture |
-| `claude_plan_perf`    | Ask Claude to plan performance improvements       |
-| `claude_implement`    | Ask Claude to write or modify code                |
-
-## Codex Teammate Agent
-
-You can spawn Codex as a **Claude Code teammate** — a subagent that automatically uses the bridge tools to give you a second opinion, review code, or work on tasks in parallel.
-
-### Install the Agent
+Install them individually with:
 
 ```bash
-npx claude-codex-bridge install agent --global    # or --local
+npx harness-bridge install skill claude --global
+npx harness-bridge install skill codex --global
+npx harness-bridge install agent --global
 ```
 
-### Usage
-
-Once installed, spawn the teammate from Claude Code using the Task tool:
-
-```
-# Code review
-Task(subagent_type: "codex-teammate", prompt: "Review src/lib/exec-runner.ts for bugs and performance issues")
-
-# Explain unfamiliar code
-Task(subagent_type: "codex-teammate", prompt: "Explain the architecture of the MCP server in codex-server.ts")
-
-# Critique a plan
-Task(subagent_type: "codex-teammate", prompt: "Critique this plan: [your plan here]")
-
-# Performance analysis
-Task(subagent_type: "codex-teammate", prompt: "Analyze performance bottlenecks in the output parser")
-
-# General question
-Task(subagent_type: "codex-teammate", prompt: "What's the best approach for adding retry logic to the bridge?")
-```
-
-The agent automatically picks the right Codex tool (`codex_review_code`, `codex_explain_code`, `codex_plan_perf`, etc.) based on your request.
+Use `--local` instead to install into the current project.
 
 ## Configuration
 
-| Variable             | Description                                                  | Default           |
-| -------------------- | ------------------------------------------------------------ | ----------------- |
-| `BRIDGE_TIMEOUT_MS`  | Subprocess timeout in milliseconds                           | `600000` (10 min) |
-| `BRIDGE_MAX_RETRIES` | Auto-retries on transient errors (rate limits, 5xx, network) | `2`               |
-| `BRIDGE_DEBUG`       | Enable debug logging to stderr                               | —                 |
-| `BRIDGE_DEPTH`       | Current recursion depth (set automatically)                  | `0`               |
-| `CODEX_BRIDGE_MAX_CONCURRENT` | Max simultaneous `codex exec` subprocesses (fork) | `4`               |
-| `CODEX_BRIDGE_BACKEND` | Set to `app-server` to use the experimental backend (fork) | `exec`            |
+| Variable                              | Purpose                                       | Default   |
+| ------------------------------------- | --------------------------------------------- | --------- |
+| `HARNESS_BRIDGE_TIMEOUT_MS`           | Per-call process timeout                      | `1800000` |
+| `HARNESS_BRIDGE_MAX_RETRIES`          | Retries for transient CLI failures            | `2`       |
+| `HARNESS_BRIDGE_DEBUG`                | Enable debug logging on stderr                | unset     |
+| `HARNESS_BRIDGE_DEPTH`                | Recursion depth propagated to child harnesses | `0`       |
+| `HARNESS_BRIDGE_CODEX_MAX_CONCURRENT` | Maximum simultaneous `codex exec` processes   | `4`       |
+| `HARNESS_BRIDGE_CODEX_BACKEND`        | `exec` or opt-in `app-server`                 | `exec`    |
 
-### Concurrency (fork)
+The previous `BRIDGE_*` and `CODEX_BRIDGE_*` names remain accepted for compatibility. New configuration should use `HARNESS_BRIDGE_*`.
 
-`CODEX_BRIDGE_MAX_CONCURRENT` caps in-flight `codex exec` subprocesses. Without a cap, N parallel reviewers spawn N unmanaged processes, each able to hold a slot for the full timeout. Waiters are served FIFO so a burst cannot starve an earlier caller. An invalid value falls back to the default rather than throwing — a typo in a shell profile should not take the bridge down.
-
-Correctness under concurrency comes from thread isolation, not this cap: see `threadKey` above.
-
-### `app-server` backend (fork, experimental)
+### Codex app-server backend
 
 ```bash
-CODEX_BRIDGE_BACKEND=app-server
+HARNESS_BRIDGE_CODEX_BACKEND=app-server npx harness-bridge serve codex
 ```
 
-Drives Codex through the `codex app-server` JSON-RPC service instead of spawning a `codex exec` per call. Threads are first-class in that protocol, so it gains a per-turn sandbox that survives resume, `writableRoots` for least-privilege worktree access, and `turn/interrupt` for cancellation.
+The experimental app-server backend keeps one persistent Codex process, supports first-class threads, and can interrupt active turns. It uses the same unrestricted execution policy as the default exec backend.
 
-**Off by default.** `codex app-server` is still marked experimental in the CLI, so the exec path remains the fallback. Verified to return output identical to the exec backend for the same call. Full rationale in [FORK.md](./FORK.md).
+## Migrating from claude-codex-bridge
 
-### Anti-Recursion Guard
-
-The bridge automatically prevents infinite loops. If Claude calls Codex which tries to call Claude again, the second call is blocked (`BRIDGE_DEPTH >= 2`).
+See [MIGRATION.md](./MIGRATION.md) for the package, command, configuration, and environment-variable changes. MCP server names and tool names are unchanged.
 
 ## Development
 
 ```bash
-git clone https://github.com/Dunqing/claude-codex-bridge.git
-cd claude-codex-bridge
+git clone https://github.com/rbutera/harness-bridge.git
+cd harness-bridge
 pnpm install
-
-pnpm build         # Compile to dist/
-pnpm test          # Run tests
-pnpm lint          # Lint and type check
-
-# Dev mode (no build needed)
-pnpm dev:codex-server
-pnpm dev:claude-server
+pnpm check
 ```
 
-## License
+`pnpm check` runs formatting, lint/type checking, all tests, the production build, and package linting.
 
-[MIT](./LICENSE)
+## Origin and license
+
+Harness Bridge began from Dunqing’s [`claude-codex-bridge`](https://github.com/Dunqing/claude-codex-bridge) v0.3.1. The original Git history and authorship are preserved; [ORIGIN.md](./ORIGIN.md) records the lineage and subsequent divergence.
+
+Licensed under the [MIT License](./LICENSE).

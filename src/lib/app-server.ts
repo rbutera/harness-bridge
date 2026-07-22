@@ -1,32 +1,25 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { JsonRpcDecoder, encode, isResponse, type JsonRpcMessage } from "./jsonrpc.js";
-import { toSandboxPolicy } from "./sandbox-policy.js";
+import { unrestrictedSandboxPolicy } from "./sandbox-policy.js";
+import { PRODUCT_NAME, PRODUCT_TITLE, PRODUCT_VERSION } from "./harness.js";
 import { logger, type ProgressReporter } from "./logger.js";
-import type { SandboxMode } from "./thread-registry.js";
 import type { CodexResult } from "./types.js";
 
 /**
  * Phase 2 backend: drive Codex through `codex app-server` instead of spawning a
  * `codex exec` subprocess per call.
  *
- * Why this exists, beyond tidiness. The exec transport has three structural
+ * Why this exists, beyond tidiness. The exec transport has two structural
  * limits that no amount of care around it removes:
  *
- * - **`codex exec resume` takes no `--sandbox`.** The sandbox of a resumed
- *   thread is whatever created it, so continuity and sandbox control are
- *   mutually exclusive. Here `turn/start` carries a per-turn `sandboxPolicy`,
- *   so they are independent.
- * - **`--sandbox workspace-write` only grants the cwd.** That is what breaks git
- *   worktrees, whose `.git` lives in the parent repo, and the only escape was
- *   `danger-full-access`. The app-server takes explicit `writableRoots`, so a
- *   worktree gets exactly its git directory. Least privilege becomes possible.
+ * - **Process cost.** Exec starts a new CLI process for every call.
  * - **No cancellation.** A wedged exec holds its slot until the timeout expires.
  *   `turn/interrupt` cancels a turn in flight.
  *
  * Threads are first-class in the protocol, so concurrency is a protocol feature
  * rather than something the caller works around.
  *
- * Enable with `CODEX_BRIDGE_BACKEND=app-server`. It ships disabled: the exec
+ * Enable with `HARNESS_BRIDGE_CODEX_BACKEND=app-server`. It ships disabled: the exec
  * path stays the default until this has run in anger, and `codex app-server` is
  * still marked experimental in the CLI.
  *
@@ -35,16 +28,17 @@ import type { CodexResult } from "./types.js";
  * --skip-git-repo-check was not specified"); the app-server has no equivalent
  * guard and will happily work in a bare directory. Inside a git repo the two
  * backends returned identical output for the same tool call (17.8s vs 19.5s on
- * a read-only file read). Treat the missing guard as a real difference, not an
+ * a file query). Treat the missing guard as a real difference, not an
  * improvement: it removes a check that today prevents a stray call from acting
  * somewhere unintended.
  */
 
-export const BACKEND_ENV_VAR = "CODEX_BRIDGE_BACKEND";
+export const BACKEND_ENV_VAR = "HARNESS_BRIDGE_CODEX_BACKEND";
+export const LEGACY_BACKEND_ENV_VAR = "CODEX_BRIDGE_BACKEND";
 
 /** True when the app-server backend has been explicitly opted into. */
 export function isAppServerEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  return env[BACKEND_ENV_VAR] === "app-server";
+  return (env[BACKEND_ENV_VAR] ?? env[LEGACY_BACKEND_ENV_VAR]) === "app-server";
 }
 
 interface Pending {
@@ -55,9 +49,6 @@ interface Pending {
 export interface TurnOptions {
   prompt: string;
   cwd?: string;
-  sandbox: SandboxMode;
-  /** Extra paths to make writable under `workspace-write` (e.g. a worktree's git dir). */
-  writableRoots?: string[];
   model?: string;
   effort?: string;
   /** Resume this thread instead of starting a new one. */
@@ -121,7 +112,7 @@ export class AppServerClient {
     });
 
     await this.request("initialize", {
-      clientInfo: { name: "claude-codex-bridge", title: "Claude Codex Bridge", version: "0.3.1" },
+      clientInfo: { name: PRODUCT_NAME, title: PRODUCT_TITLE, version: PRODUCT_VERSION },
       capabilities: null,
     });
   }
@@ -165,22 +156,18 @@ export class AppServerClient {
   async runTurn(options: TurnOptions): Promise<CodexResult> {
     await this.start();
 
-    const sandboxPolicy = toSandboxPolicy(options.sandbox, {
-      writableRoots: options.writableRoots,
-    });
+    const sandboxPolicy = unrestrictedSandboxPolicy();
 
-    // Unlike `codex exec resume`, resuming here still accepts a sandbox, so
-    // continuity never costs sandbox control.
     const threadResult = (await (options.resumeThreadId
       ? this.request("thread/resume", {
           threadId: options.resumeThreadId,
           cwd: options.cwd,
-          sandbox: options.sandbox,
+          sandbox: "danger-full-access",
           model: options.model,
         })
       : this.request("thread/start", {
           cwd: options.cwd,
-          sandbox: options.sandbox,
+          sandbox: "danger-full-access",
           model: options.model,
         }))) as { thread?: { id?: string }; threadId?: string };
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CONCURRENCY_ENV_VAR,
   DEFAULT_MAX_CONCURRENT,
+  LEGACY_CONCURRENCY_ENV_VAR,
   Semaphore,
   resolveMaxConcurrent,
 } from "../src/lib/semaphore.js";
@@ -24,6 +25,10 @@ describe("resolveMaxConcurrent", () => {
 
   it("reads a valid override", () => {
     expect(resolveMaxConcurrent({ [CONCURRENCY_ENV_VAR]: "8" })).toBe(8);
+  });
+
+  it("accepts the legacy override", () => {
+    expect(resolveMaxConcurrent({ [LEGACY_CONCURRENCY_ENV_VAR]: "6" })).toBe(6);
   });
 
   it.each(["nonsense", "0", "-3", ""])("falls back rather than throwing on %j", (value) => {

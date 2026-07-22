@@ -1,24 +1,25 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { execCommand, resolveTimeoutMs, TIMEOUT_ENV_VAR } from "./lib/exec-runner.js";
 import { parseCodexOutput } from "./lib/codex-output-parser.js";
 import { buildExplainCodePrompt, buildPlanPerfPrompt } from "./lib/prompt-builder.js";
 import { createProgressReporter, logger, type ProgressReporter } from "./lib/logger.js";
-import { ThreadRegistry, type SandboxMode } from "./lib/thread-registry.js";
+import { SessionRegistry } from "./lib/session-registry.js";
 import { Semaphore, resolveMaxConcurrent } from "./lib/semaphore.js";
 import { KeyedMutex } from "./lib/keyed-mutex.js";
 import { buildCodexArgs } from "./lib/codex-args.js";
 import { AppServerClient, isAppServerEnabled } from "./lib/app-server.js";
+import {
+  CONVERSATION_KEY_DESCRIPTION,
+  createHarnessServer,
+  HARNESSES,
+  type HarnessAdapter,
+} from "./lib/harness.js";
 import { CODEX_MODELS } from "./lib/types.js";
 import type { CodexResult } from "./lib/types.js";
 
-/**
- * Thread continuity, keyed and sandbox-matched. Replaces the module-global
- * `lastThreadId` that concurrent callers used to stomp. See thread-registry.ts.
- */
-const threads = new ThreadRegistry();
+const threads = new SessionRegistry();
 
 /** Caps concurrent `codex exec` subprocesses. See semaphore.ts. */
 const execSlots = new Semaphore(resolveMaxConcurrent());
@@ -30,41 +31,7 @@ const execSlots = new Semaphore(resolveMaxConcurrent());
  */
 const keyLocks = new KeyedMutex();
 
-const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"] as const;
-
-/**
- * Shared description for the opt-in continuity key.
- *
- * Deliberately opt-in: the default of no key gives every call its own thread,
- * which is what parallel reviewers want. Callers that genuinely need a
- * multi-turn conversation pass a stable key of their own choosing.
- */
-const THREAD_KEY_DESCRIPTION =
-  "Optional key enabling multi-turn continuity. Calls sharing a key resume the same Codex thread, " +
-  "provided the sandbox also matches. OMIT for independent one-shot calls (the default), which is " +
-  "what parallel reviews want — sharing a key across concurrent callers serialises them onto one thread.";
-
-/**
- * Sandbox control for the read-oriented tools.
- *
- * These used to hardcode `read-only`, which meant a reviewer could not run a
- * build or a test to check its own claims. It had to reason from source alone
- * and then either guess or stall trying to run a command it was denied. Callers
- * that want a reviewer to verify its findings can now grant `workspace-write`.
- *
- * The default stays `read-only`: analysis should not mutate a repo unless the
- * caller explicitly asks, and an omitted argument must never be an escalation.
- */
-const analysisSandboxSchema = z
-  .enum(SANDBOX_MODES)
-  .optional()
-  .default("read-only")
-  .describe(
-    "Sandbox level. Defaults to read-only. Pass workspace-write when the analysis should be able " +
-      "to run builds or tests to VERIFY its own findings rather than reasoning from source alone.",
-  );
-
-const server = new McpServer({ name: "codex-bridge", version: "0.1.0" });
+const server = createHarnessServer(HARNESSES.codex);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -116,18 +83,13 @@ let appServer: AppServerClient | null = null;
 /**
  * Phase 2 path. Same inputs, same `CodexResult` out, so it is a drop-in swap.
  *
- * Thread bookkeeping stays identical to the exec path, with one relaxation
- * available later: `thread/resume` accepts a sandbox, so the registry's
- * refuse-to-resume-on-mismatch rule is a safety net here rather than a
- * necessity. It is left in place so both backends behave the same way while
- * this one is still opt-in.
+ * Thread bookkeeping stays identical to the exec path.
  */
 async function runViaAppServer(
   prompt: string,
   options: {
     workingDirectory?: string;
     model?: string;
-    sandbox: SandboxMode;
     threadKey?: string;
     resumeThreadId: string | null;
     progress?: ProgressReporter;
@@ -139,14 +101,13 @@ async function runViaAppServer(
     const result = await appServer.runTurn({
       prompt,
       cwd: options.workingDirectory,
-      sandbox: options.sandbox,
       model: options.model,
       resumeThreadId: options.resumeThreadId,
       progress: options.progress,
     });
 
     if (result.threadId) {
-      threads.remember(options.threadKey, result.threadId, options.sandbox);
+      threads.remember(options.threadKey, result.threadId);
     }
     return result;
   } catch (error) {
@@ -164,56 +125,37 @@ async function runViaAppServer(
   }
 }
 
-async function runCodex(
-  prompt: string,
-  options: {
-    workingDirectory?: string;
-    model?: string;
-    sandbox?: SandboxMode;
-    threadKey?: string;
-    fullAuto?: boolean;
-    progress?: ProgressReporter;
-  } = {},
-): Promise<CodexResult> {
-  // Default to read-only so an omitted sandbox is never an implicit escalation.
-  const sandbox: SandboxMode = options.sandbox ?? "read-only";
+interface CodexRunOptions {
+  workingDirectory?: string;
+  model?: string;
+  threadKey?: string;
+  progress?: ProgressReporter;
+}
 
+async function runCodex(prompt: string, options: CodexRunOptions = {}): Promise<CodexResult> {
   // Resolving the key, running the turn, and recording the resulting thread is
   // a read-modify-write. Without a per-key lock, two concurrent calls sharing a
   // threadKey either start two threads and lose one (new key), or resume the
   // same thread at once (existing key). Keyless calls — the default — skip the
   // lock entirely and stay fully parallel.
   const key = options.threadKey;
-  if (!key) return runCodexUnlocked(prompt, options, sandbox);
-  return keyLocks.run(key, () => runCodexUnlocked(prompt, options, sandbox));
+  if (!key) return runCodexUnlocked(prompt, options);
+  return keyLocks.run(key, () => runCodexUnlocked(prompt, options));
 }
 
-async function runCodexUnlocked(
-  prompt: string,
-  options: {
-    workingDirectory?: string;
-    model?: string;
-    sandbox?: SandboxMode;
-    threadKey?: string;
-    fullAuto?: boolean;
-    progress?: ProgressReporter;
-  },
-  sandbox: SandboxMode,
-): Promise<CodexResult> {
-  const resumeThreadId = threads.resolve(options.threadKey, sandbox);
+async function runCodexUnlocked(prompt: string, options: CodexRunOptions): Promise<CodexResult> {
+  const resumeThreadId = threads.resolve(options.threadKey);
 
   // Backend swap is invisible above this line: the MCP tool surface, and so
   // every caller and the codex-teammate agent, is identical either way.
   if (isAppServerEnabled()) {
-    return runViaAppServer(prompt, { ...options, sandbox, resumeThreadId });
+    return runViaAppServer(prompt, { ...options, resumeThreadId });
   }
 
   const args = buildCodexArgs({
     prompt,
     resumeThreadId,
     model: options.model,
-    sandbox,
-    fullAuto: options.fullAuto,
   });
 
   if (execSlots.available === 0) {
@@ -277,9 +219,9 @@ async function runCodexUnlocked(
   // Only remember the thread when the caller opted into continuity with a key.
   // Without a key this is a no-op, so concurrent callers cannot stomp each other.
   if (parsed.threadId) {
-    threads.remember(options.threadKey, parsed.threadId, sandbox);
+    threads.remember(options.threadKey, parsed.threadId);
     if (options.threadKey) {
-      logger.debug(`Stored thread ${parsed.threadId} for key '${options.threadKey}' (${sandbox})`);
+      logger.debug(`Stored thread ${parsed.threadId} for key '${options.threadKey}'`);
     }
   } else if (options.threadKey) {
     // Codex returned no thread id, so a later resume under this key would target
@@ -341,6 +283,11 @@ function formatCodexResponse(parsed: CodexResult): {
   return { content: [{ type: "text", text }] };
 }
 
+const codexAdapter: HarnessAdapter<CodexResult, CodexRunOptions> = {
+  descriptor: HARNESSES.codex,
+  run: runCodex,
+};
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -363,20 +310,14 @@ server.registerTool(
         .describe(
           "Override the Codex model. OMIT this unless explicitly told otherwise: when omitted, the Codex CLI uses the default from ~/.codex/config.toml, which is kept current. This enum may lag behind newly released models.",
         ),
-      sandbox: z
-        .enum(SANDBOX_MODES)
-        .optional()
-        .default("read-only")
-        .describe("Sandbox level controlling what Codex can modify"),
-      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
+      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
     },
   },
-  async ({ prompt, workingDirectory, model, sandbox, threadKey }, extra) => {
+  async ({ prompt, workingDirectory, model, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
-    const parsed = await runCodex(prompt, {
+    const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
       model,
-      sandbox,
       threadKey,
       progress,
     });
@@ -402,19 +343,17 @@ server.registerTool(
         .describe("Focus on: bugs, performance, style, security, etc."),
       context: z.string().optional().describe("Additional context about the codebase or changes"),
       workingDirectory: z.string().optional(),
-      sandbox: analysisSandboxSchema,
-      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
+      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
     },
   },
-  async ({ target, focusAreas, context, workingDirectory, sandbox, threadKey }, extra) => {
+  async ({ target, focusAreas, context, workingDirectory, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     let prompt = `Review the following code changes. Provide specific, actionable feedback with line references.\n\nTarget: ${target}`;
     if (focusAreas) prompt += `\n\nFocus areas: ${focusAreas}`;
     if (context) prompt += `\n\nContext: ${context}`;
 
-    const parsed = await runCodex(prompt, {
+    const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      sandbox,
       threadKey,
       progress,
     });
@@ -436,19 +375,17 @@ server.registerTool(
         .optional()
         .describe("Known constraints: timeline, tech stack, compatibility"),
       workingDirectory: z.string().optional(),
-      sandbox: analysisSandboxSchema,
-      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
+      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
     },
   },
-  async ({ plan, codebasePath, constraints, workingDirectory, sandbox, threadKey }, extra) => {
+  async ({ plan, codebasePath, constraints, workingDirectory, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     let prompt = `Critique this implementation plan. Identify gaps, risks, missing edge cases, and suggest improvements.\n\nPlan:\n${plan}`;
     if (codebasePath) prompt += `\n\nRelevant codebase: ${codebasePath}`;
     if (constraints) prompt += `\n\nConstraints: ${constraints}`;
 
-    const parsed = await runCodex(prompt, {
+    const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      sandbox,
       threadKey,
       progress,
     });
@@ -473,16 +410,14 @@ server.registerTool(
         .describe("Depth of explanation: overview, detailed, or full execution trace"),
       context: z.string().optional().describe("Additional context about the codebase"),
       workingDirectory: z.string().optional(),
-      sandbox: analysisSandboxSchema,
-      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
+      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
     },
   },
-  async ({ target, depth, context, workingDirectory, sandbox, threadKey }, extra) => {
+  async ({ target, depth, context, workingDirectory, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const prompt = buildExplainCodePrompt({ target, depth, context });
-    const parsed = await runCodex(prompt, {
+    const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      sandbox,
       threadKey,
       progress,
     });
@@ -508,19 +443,14 @@ server.registerTool(
         .describe("Constraints: must not increase binary size, etc."),
       context: z.string().optional().describe("Additional context about usage patterns"),
       workingDirectory: z.string().optional(),
-      sandbox: analysisSandboxSchema,
-      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
+      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
     },
   },
-  async (
-    { target, metrics, constraints, context, workingDirectory, sandbox, threadKey },
-    extra,
-  ) => {
+  async ({ target, metrics, constraints, context, workingDirectory, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const prompt = buildPlanPerfPrompt({ target, metrics, constraints, context });
-    const parsed = await runCodex(prompt, {
+    const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      sandbox,
       threadKey,
       progress,
     });
@@ -543,27 +473,15 @@ server.registerTool(
         .describe(
           "Override the Codex model. OMIT this unless explicitly told otherwise: when omitted, the Codex CLI uses the default from ~/.codex/config.toml, which is kept current. This enum may lag behind newly released models.",
         ),
-      sandbox: z
-        .enum(["workspace-write", "danger-full-access"])
-        .optional()
-        .default("workspace-write")
-        .describe(
-          "Sandbox level (must allow writes). NOTE: workspace-write excludes a git worktree's " +
-            "real .git directory, which lives at <main-repo>/.git/worktrees/<name>. Inside a " +
-            "worktree it blocks commits and blocks test hosts that need to write outside the " +
-            "workspace, so use danger-full-access there.",
-        ),
-      threadKey: z.string().optional().describe(THREAD_KEY_DESCRIPTION),
+      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
     },
   },
-  async ({ task, workingDirectory, model, sandbox, threadKey }, extra) => {
+  async ({ task, workingDirectory, model, threadKey }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
-    const parsed = await runCodex(task, {
+    const parsed = await codexAdapter.run(task, {
       workingDirectory,
       model,
-      sandbox,
       threadKey,
-      fullAuto: true,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -577,10 +495,10 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info("codex-bridge MCP server started on stdio");
+  logger.info("harness-bridge codex adapter started on stdio");
 }
 
 main().catch((err) => {
-  logger.error("Failed to start codex-bridge:", err);
+  logger.error("Failed to start harness-bridge codex adapter:", err);
   process.exit(1);
 });
