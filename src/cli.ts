@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { defineCommand, runMain } from "citty";
-import { PRODUCT_NAME } from "./lib/harness.js";
+import { PRODUCT_NAME, PRODUCT_VERSION } from "./lib/harness.js";
 
 const main = defineCommand({
   meta: {
     name: PRODUCT_NAME,
+    version: PRODUCT_VERSION,
     description: "Connect coding-agent harnesses through MCP",
   },
   subCommands: {

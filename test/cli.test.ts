@@ -14,6 +14,12 @@ function runCli(args: string[]) {
 }
 
 describe("cli", { timeout: 10_000 }, () => {
+  it("reports the package version", async () => {
+    const result = await runCli(["--version"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("0.4.0");
+  });
+
   it("shows help with available commands when no subcommand given", async () => {
     const result = await runCli([]);
     expect(result.exitCode).not.toBe(0);
