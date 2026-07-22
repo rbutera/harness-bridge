@@ -4,6 +4,8 @@ Harness Bridge began from [`Dunqing/claude-codex-bridge`](https://github.com/Dun
 
 The project diverged after upstream v0.3.1, initially as `rbutera/claude-codex-bridge`, then became the standalone `harness-bridge` project at v0.4.0. This document preserves the technical record of the pre-v0.4.0 divergence. File paths, environment variables, and product names below describe that historical state and may differ from the current implementation.
 
+> **Current v0.4.0 policy:** the sandbox controls described below no longer exist. Harness Bridge always starts and resumes Codex with approvals and sandboxing bypassed. The MCP tools cannot select a restrictive mode.
+
 ---
 
 ## TL;DR
