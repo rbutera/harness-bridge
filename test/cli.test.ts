@@ -1,17 +1,19 @@
+import { createRequire } from "node:module";
 import { describe, it, expect } from "vitest";
 import { execCommand } from "../src/lib/exec-runner.js";
 
 const CLI_PATH = new URL("../src/cli.ts", import.meta.url).pathname;
+const TSX_CLI_PATH = createRequire(import.meta.url).resolve("tsx/cli");
 
 function runCli(args: string[]) {
   return execCommand({
-    command: "npx",
-    args: ["tsx", CLI_PATH, ...args],
+    command: process.execPath,
+    args: [TSX_CLI_PATH, CLI_PATH, ...args],
     timeoutMs: 5000,
   });
 }
 
-describe("cli", () => {
+describe("cli", { timeout: 10_000 }, () => {
   it("shows help with available commands when no subcommand given", async () => {
     const result = await runCli([]);
     expect(result.exitCode).not.toBe(0);
