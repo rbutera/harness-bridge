@@ -8,20 +8,51 @@ on:
 
 jobs:
   check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: mkdir package && pnpm pack --pack-destination package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: package/*.tgz
+          if-no-files-found: error
+
+  package-smoke:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
         node-version: [18, 22]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
-          cache: pnpm
 
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: package
+
+      - name: Install and exercise the published package
+        run: |
+          mkdir smoke
+          cd smoke
+          npm init --yes
+          npm install ../package/*.tgz
+          ./node_modules/.bin/harness-bridge --version
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1.0.0"}}}' | ./node_modules/.bin/hb-codex | grep 'Harness Bridge: OpenAI Codex'
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1.0.0"}}}' | ./node_modules/.bin/hb-claude | grep 'Harness Bridge: Claude Code'
+          npm audit --omit=dev
