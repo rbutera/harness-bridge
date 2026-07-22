@@ -10,16 +10,16 @@ Upstream is at `v0.3.1` and has been unmaintained since February 2026.
 
 | | Upstream v0.3.1 | This fork |
 |---|---|---|
-| Commits ahead | — | 4 |
-| `src/` lines | 1,723 | 2,504 (+45%) |
-| Test files / cases | 5 | 11 / 104 |
-| New source modules | — | 6 |
-| Concurrency model | one global thread pointer | per-key thread isolation + bounded pool |
+| Commits ahead | — | 6 |
+| `src/` lines | 1,723 | 2,596 (+51%) |
+| Test files / cases | 5 | 12 / 113 |
+| New source modules | — | 7 |
+| Concurrency model | one global thread pointer | per-key thread isolation + per-key serialization + bounded pool |
 | Sandbox on analysis tools | hardcoded `read-only` | caller-controlled, defaults `read-only` |
 | Sandbox on resume | silently dropped | matched, or a fresh thread |
 | Backends | `codex exec` only | `codex exec` (default) + `codex app-server` (opt-in) |
 
-Diff: `+1293 / -59` across 16 files. The reverse leg (`src/claude-server.ts`, Codex→Claude) is **untouched** — every change is on the Claude→Codex side.
+Diff: `+1830 / -59` across 21 files. The reverse leg (`src/claude-server.ts`, Codex→Claude) is **untouched** — every change is on the Claude→Codex side.
 
 ---
 
@@ -27,7 +27,7 @@ Diff: `+1293 / -59` across 16 files. The reverse leg (`src/claude-server.ts`, Co
 
 The bridge was reported "saturated" under concurrent review load: a `/wave` run fires an Opus reviewer and a Codex reviewer in parallel, per wave, sometimes across several worktrees at once. That workload broke it.
 
-Diagnosis found three separate defects, two of which fail **silently** — they report success while doing something other than what was asked. Those are the expensive kind: a loud failure costs you a retry, a quiet one costs you a wrong decision made confidently.
+Diagnosis found three defects. An independent Codex review of the fix then found a fourth. Three of the four fail **silently**: they report success while doing something other than what was asked. Those are the expensive kind, because a loud failure costs you a retry and a quiet one costs you a wrong decision made confidently.
 
 ---
 
@@ -49,6 +49,19 @@ With N reviewers in flight, each call mutates the shared pointer and `codex exec
 - **A key resumes only that key's thread**, and only when the sandbox also matches (see defect 2).
 
 Concurrent callers can no longer see each other's threads at all.
+
+### Defect 1b — explicit key sharing was still racy
+
+Caught by an independent Codex review of the fix above, which is the point of having one.
+
+Killing the global made *implicit* sharing impossible but left *explicit* sharing unsafe. Resolving a key, running the turn, and recording the resulting thread is a read-modify-write, and it was not atomic. Two concurrent calls on one `threadKey`:
+
+- **New key:** both resolve to `null`, both start their own thread, both write the registry. One thread id is lost and its conversation orphaned — the continuity the caller asked for silently did not happen.
+- **Existing key:** both resolve the same id and both `codex exec resume` it at once. The original interleaving bug, scoped to a key.
+
+Documenting "never share a key across concurrent callers" was not enough: a rule in prose is precisely a check that cannot fail, and the failure it permits is silent.
+
+`src/lib/keyed-mutex.ts` now serializes the whole sequence per key. Keyless calls skip the lock and stay fully parallel. Serializing a key costs nothing legitimate, since a conversation is inherently sequential. Lock order is always key mutex → exec semaphore, and semaphore holders never take a key lock, so there is no deadlock cycle.
 
 ---
 
@@ -104,7 +117,7 @@ FIFO-fair, so a burst cannot starve an earlier caller. Slots release in a `final
 
 `src/lib/app-server.ts`, `src/lib/jsonrpc.ts`, `src/lib/sandbox-policy.ts`.
 
-Enable with `CODEX_BRIDGE_BACKEND=app-server`. **Ships disabled.**
+Enable with `CODEX_BRIDGE_BACKEND=app-server`. **The repo default is still `exec`**, so a plain checkout is unchanged; set the env var to opt in. (Our own fleet sets it on the MCP server entry, so app-server is what actually runs there.)
 
 The exec transport has limits that are structural rather than things care can work around. `codex app-server` is a JSON-RPC service where threads are first-class:
 
@@ -149,6 +162,7 @@ The app-server backend was verified against real Codex rather than only compiled
 |---|---|
 | `src/lib/thread-registry.ts` | Keyed, sandbox-matched thread continuity. Replaces the global. |
 | `src/lib/semaphore.ts` | FIFO-fair bounded concurrency for `codex exec`. |
+| `src/lib/keyed-mutex.ts` | Serializes calls sharing a `threadKey`, making resolve/run/remember atomic. |
 | `src/lib/codex-args.ts` | Builds `codex` argv. Separate from the server so tests can import it without the server's top-level `main()` starting a real stdio process. |
 | `src/lib/app-server.ts` | JSON-RPC client for `codex app-server`. |
 | `src/lib/jsonrpc.ts` | Newline-delimited JSON-RPC framing. |
