@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2026-08-10
+
+- Fixed a Codex app-server MCP-stack memory leak by disposing per-call threads (`keepThread` + `thread/delete`, reap-on-drop) instead of letting them accumulate.
+- Fast-fail wedged Codex requests with a 120s request timeout, ending the intermittent 30-minute hangs. (#3)
+
 ## 0.4.0 - 2026-07-22
 
 - Renamed the standalone project, npm package, and CLI to Harness Bridge.

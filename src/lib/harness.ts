@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 export const PRODUCT_NAME = "harness-bridge";
 export const PRODUCT_TITLE = "Harness Bridge";
-export const PRODUCT_VERSION = "0.4.0";
+export const PRODUCT_VERSION = "0.4.1";
 
 export type HarnessId = "claude" | "codex";
 
