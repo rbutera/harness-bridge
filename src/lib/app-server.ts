@@ -3,6 +3,7 @@ import { JsonRpcDecoder, encode, isResponse, type JsonRpcMessage } from "./jsonr
 import { unrestrictedSandboxPolicy } from "./sandbox-policy.js";
 import { PRODUCT_NAME, PRODUCT_TITLE, PRODUCT_VERSION } from "./harness.js";
 import { logger, type ProgressReporter } from "./logger.js";
+import { resolveTimeoutMs } from "./exec-runner.js";
 import type { CodexResult } from "./types.js";
 
 /**
@@ -41,9 +42,36 @@ export function isAppServerEnabled(env: Record<string, string | undefined> = pro
   return (env[BACKEND_ENV_VAR] ?? env[LEGACY_BACKEND_ENV_VAR]) === "app-server";
 }
 
+/**
+ * How long to wait for a single app-server JSON-RPC response before treating the
+ * server as wedged.
+ *
+ * The failure this bounds is real and was expensive: under memory pressure the
+ * `codex app-server` gets swapped out and stops answering. A protocol request
+ * (`initialize`, `thread/start`, `turn/start`) then never comes back, and with no
+ * timeout the whole call hangs until the MCP client's own ~30-minute limit fires.
+ * A bounded request turns "hangs for half an hour" into "fails in two minutes and
+ * the next call spawns a fresh server".
+ */
+export const REQUEST_TIMEOUT_ENV_VAR = "HARNESS_BRIDGE_APP_SERVER_REQUEST_TIMEOUT_MS";
+
+function resolveRequestTimeoutMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env[REQUEST_TIMEOUT_ENV_VAR];
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
+}
+
+/**
+ * Best-effort thread disposal must never hold up a completed turn. If the server
+ * is too wedged to answer a `thread/delete` in this window, the leaked stack is a
+ * smaller problem than blocking the caller, so we give up and log.
+ */
+const DISPOSE_TIMEOUT_MS = 10_000;
+
 interface Pending {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 export interface TurnOptions {
@@ -53,6 +81,17 @@ export interface TurnOptions {
   effort?: string;
   /** Resume this thread instead of starting a new one. */
   resumeThreadId?: string | null;
+  /**
+   * Keep the thread alive after the turn so a later call can resume it.
+   *
+   * Defaults to disposing the thread. The app-server spawns a full MCP stack —
+   * one child process per configured server — for each thread it starts, and
+   * terminates those children only when the thread is dropped. A caller that
+   * starts a thread, runs one turn, and walks away therefore leaks an entire MCP
+   * stack every time. Only a caller that will actually resume the thread (one
+   * holding a `threadKey`) should keep it.
+   */
+  keepThread?: boolean;
   progress?: ProgressReporter;
 }
 
@@ -106,9 +145,13 @@ export class AppServerClient {
     child.on("exit", (code: number | null) => {
       // Fail every in-flight call rather than leaving callers hanging forever.
       const error = new Error(`codex app-server exited with code ${code}`);
-      for (const pending of this.#pending.values()) pending.reject(error);
+      for (const pending of this.#pending.values()) {
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.reject(error);
+      }
       this.#pending.clear();
       this.#child = null;
+      this.#ready = null;
     });
 
     await this.request("initialize", {
@@ -122,6 +165,7 @@ export class AppServerClient {
       const pending = this.#pending.get(message.id as number);
       if (!pending) return;
       this.#pending.delete(message.id as number);
+      if (pending.timer) clearTimeout(pending.timer);
       if (message.error) {
         pending.reject(new Error(`${message.error.message} (code ${message.error.code})`));
       } else {
@@ -132,14 +176,45 @@ export class AppServerClient {
     for (const handler of this.#notificationHandlers) handler(message);
   }
 
-  /** Issue a JSON-RPC request and await its response. */
-  request(method: string, params: unknown): Promise<unknown> {
+  /**
+   * Tear the app-server down after it stops answering, so the next call spawns a
+   * fresh one rather than queueing behind a wedged process. Killing the child
+   * fires its `exit` handler, which rejects every remaining in-flight call.
+   */
+  #markUnhealthy(): void {
+    const child = this.#child;
+    this.#child = null;
+    this.#ready = null;
+    child?.kill();
+  }
+
+  /**
+   * Issue a JSON-RPC request and await its response.
+   *
+   * `timeoutMs` bounds the wait. A non-positive value disables the bound (used by
+   * callers that impose their own, longer, bound around a whole turn).
+   */
+  request(
+    method: string,
+    params: unknown,
+    timeoutMs = resolveRequestTimeoutMs(),
+  ): Promise<unknown> {
     const child = this.#child;
     if (!child) return Promise.reject(new Error("app-server is not running"));
 
     const id = ++this.#nextId;
     return new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+      const pending: Pending = { resolve, reject };
+      if (timeoutMs > 0) {
+        pending.timer = setTimeout(() => {
+          // Only act if we still own this id; a response may have raced in.
+          if (!this.#pending.delete(id)) return;
+          reject(new Error(`app-server request '${method}' timed out after ${timeoutMs}ms`));
+          this.#markUnhealthy();
+        }, timeoutMs);
+        pending.timer.unref?.();
+      }
+      this.#pending.set(id, pending);
       child.stdin.write(encode({ id, method, params }));
     });
   }
@@ -183,8 +258,9 @@ export class AppServerClient {
       errors: [],
     };
 
+    let unsubscribe: () => void = () => {};
     const completion = new Promise<void>((resolve, reject) => {
-      const unsubscribe = this.#onNotification((message) => {
+      unsubscribe = this.#onNotification((message) => {
         const params = (message.params ?? {}) as Record<string, unknown>;
         // Ignore traffic belonging to other concurrent turns.
         if (params["threadId"] && params["threadId"] !== threadId) return;
@@ -210,14 +286,12 @@ export class AppServerClient {
             break;
           }
           case "turn/completed": {
-            unsubscribe();
             resolve();
             break;
           }
           case "error": {
             const text = String(params["message"] ?? "unknown app-server error");
             result.errors.push(text);
-            unsubscribe();
             reject(new Error(text));
             break;
           }
@@ -225,23 +299,89 @@ export class AppServerClient {
       });
     });
 
-    options.progress?.report("Starting codex turn...");
-    await this.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: options.prompt, text_elements: [] }],
-      cwd: options.cwd,
-      sandboxPolicy,
-      model: options.model,
-      effort: options.effort,
-    });
+    try {
+      options.progress?.report("Starting codex turn...");
+      await this.request("turn/start", {
+        threadId,
+        input: [{ type: "text", text: options.prompt, text_elements: [] }],
+        cwd: options.cwd,
+        sandboxPolicy,
+        model: options.model,
+        effort: options.effort,
+      });
 
-    await completion;
+      await this.#withTimeout(
+        completion,
+        resolveTimeoutMs(),
+        `codex turn on thread ${threadId}`,
+        () => {
+          // Best-effort: nudge the server to abandon the turn so its slot frees up.
+          void this.interrupt(threadId).catch(() => {});
+        },
+      );
+    } catch (error) {
+      // The thread is abandoned now — free its MCP stack instead of leaking it.
+      await this.disposeThread(threadId);
+      throw error;
+    } finally {
+      unsubscribe();
+    }
+
+    // A throwaway thread (no caller will resume it) is deleted so the app-server
+    // drops it and terminates the per-thread MCP servers it spawned. Skipping this
+    // is the whole respawn-without-reap leak: one abandoned MCP stack per call.
+    if (!options.keepThread) await this.disposeThread(threadId);
     return result;
   }
 
   /** Cancel a turn in flight. The exec backend has no equivalent. */
   async interrupt(threadId: string): Promise<void> {
     await this.request("turn/interrupt", { threadId });
+  }
+
+  /**
+   * Delete a thread we are finished with. The app-server terminates that thread's
+   * MCP servers when the thread is dropped, so this is what stops a throwaway call
+   * from leaking a full MCP stack. Best-effort by design: a failure here must
+   * never surface to the caller or hold up a completed turn, so it is bounded by
+   * a short timeout and swallowed.
+   */
+  async disposeThread(threadId: string): Promise<void> {
+    if (!this.#child) return;
+    try {
+      await this.request("thread/delete", { threadId }, DISPOSE_TIMEOUT_MS);
+    } catch (error) {
+      logger.debug(
+        `thread/delete failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Race a promise against a timeout. On expiry, `onTimeout` runs (best-effort
+   * cleanup) and the returned promise rejects. A non-positive `ms` disables the
+   * bound and returns the promise unchanged.
+   */
+  async #withTimeout<T>(
+    promise: Promise<T>,
+    ms: number,
+    label: string,
+    onTimeout: () => void,
+  ): Promise<T> {
+    if (!(ms > 0)) return promise;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        onTimeout();
+        reject(new Error(`${label} timed out after ${ms}ms`));
+      }, ms);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** Extract the fields the bridge reports from a completed item. */

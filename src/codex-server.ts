@@ -103,6 +103,10 @@ async function runViaAppServer(
       cwd: options.workingDirectory,
       model: options.model,
       resumeThreadId: options.resumeThreadId,
+      // Keep the thread alive only when a caller can resume it (it has a
+      // threadKey). A keyless, throwaway call disposes its thread so the
+      // app-server tears down that thread's MCP stack instead of leaking it.
+      keepThread: Boolean(options.threadKey),
       progress: options.progress,
     });
 
