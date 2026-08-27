@@ -49,6 +49,7 @@
   },
   "scripts": {
     "build": "tsdown",
+    "generate:protocol": "codex app-server generate-ts --out src/generated",
     "dev:codex-server": "tsx src/codex-server.ts",
     "dev:claude-server": "tsx src/claude-server.ts",
     "test": "vitest run",

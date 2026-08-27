@@ -7,20 +7,37 @@ const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 vi.mock("node:child_process", () => ({ spawn: spawnMock }));
 
 import { AppServerClient } from "../src/lib/app-server.js";
+import {
+  OverloadedError,
+  RequestError,
+  ServerCrashedError,
+  SpawnError,
+} from "../src/lib/app-server-errors.js";
 
 type TurnBehavior = "complete" | "error" | "hang";
+
+/** A request interceptor: return true to claim the request, false to fall through. */
+type RequestHook = (message: JsonRpcMessage, emit: (message: JsonRpcMessage) => void) => boolean;
 
 interface FakeChild {
   child: unknown;
   sentMethods: string[];
   sent: JsonRpcMessage[];
   killed: () => boolean;
+  /** Attach a custom handler for specific methods (checked before the defaults). */
+  onRequest?: RequestHook;
+  /** Emit an `exit` event, simulating a crash of the running server. */
+  crash: (code: number | null) => void;
+  /** Emit an `error` event, simulating a spawn-level failure (e.g. ENOENT). */
+  spawnError: (error: Error) => void;
 }
 
 /**
  * A stand-in for `codex app-server`. It answers protocol requests the way the
- * real server does for a happy-path turn and records every method it received,
- * so a test can assert which lifecycle calls the client made.
+ * real server (codex 0.147.0) does for a happy-path turn — matching the real
+ * wire shapes: `thread/start` returns `{ thread: { id } }`, `error`
+ * notifications carry `{ error: { message }, willRetry }` — and records every
+ * method it received, so a test can assert which lifecycle calls the client made.
  */
 function createFakeChild(turn: TurnBehavior = "complete"): FakeChild {
   const stdout = new EventEmitter();
@@ -31,29 +48,42 @@ function createFakeChild(turn: TurnBehavior = "complete"): FakeChild {
   const sent: JsonRpcMessage[] = [];
   let killed = false;
 
+  const fake: FakeChild = {
+    child,
+    sentMethods,
+    sent,
+    killed: () => killed,
+    crash: (code) => child.emit("exit", code),
+    spawnError: (error) => child.emit("error", error),
+  };
+
   const emit = (message: JsonRpcMessage) => {
     stdout.emit("data", Buffer.from(encode(message)));
   };
 
   const handle = (message: JsonRpcMessage) => {
+    if (fake.onRequest?.(message, emit)) return;
     const id = message.id as number;
     switch (message.method) {
       case "initialize":
         emit({ id, result: {} });
         break;
       case "thread/start":
-        emit({ id, result: { threadId: "T1" } });
+        emit({ id, result: { thread: { id: "T1" } } });
         break;
       case "thread/resume": {
         const params = (message.params ?? {}) as Record<string, unknown>;
-        emit({ id, result: { threadId: params["threadId"] ?? "T1" } });
+        emit({ id, result: { thread: { id: params["threadId"] ?? "T1" } } });
         break;
       }
       case "turn/start":
-        emit({ id, result: {} });
+        emit({ id, result: { turn: { id: "turn-1" } } });
         if (turn === "complete") emit({ method: "turn/completed", params: { threadId: "T1" } });
         else if (turn === "error")
-          emit({ method: "error", params: { threadId: "T1", message: "boom" } });
+          emit({
+            method: "error",
+            params: { threadId: "T1", willRetry: false, error: { message: "boom" } },
+          });
         // "hang": deliberately emit nothing further.
         break;
       case "mock/hang":
@@ -86,7 +116,7 @@ function createFakeChild(turn: TurnBehavior = "complete"): FakeChild {
     return true;
   };
 
-  return { child, sentMethods, sent, killed: () => killed };
+  return fake;
 }
 
 describe("AppServerClient thread lifecycle", () => {
@@ -157,5 +187,112 @@ describe("AppServerClient request timeout", () => {
     // A request that never comes back means the server is wedged; it must be
     // killed so the next call spawns a fresh one rather than queueing behind it.
     expect(fake.killed()).toBe(true);
+  });
+});
+
+describe("AppServerClient crash recovery", () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+  });
+
+  it("fails in-flight requests when the child crashes, then respawns cleanly", async () => {
+    const first = createFakeChild("complete");
+    const second = createFakeChild("complete");
+    spawnMock.mockReturnValueOnce(first.child).mockReturnValueOnce(second.child);
+
+    const client = new AppServerClient();
+    await client.start();
+
+    // A request with the per-request bound disabled stays pending until the crash.
+    const inflight = client.request("mock/hang", {}, 0);
+    first.crash(1);
+
+    await expect(inflight).rejects.toBeInstanceOf(ServerCrashedError);
+    await expect(inflight).rejects.toThrow(/exited with code 1/);
+
+    // The client reset on the crash, so the next call spawns a fresh server and
+    // re-runs the initialize handshake rather than reusing the dead child.
+    const result = await client.runTurn({ prompt: "hi", keepThread: false });
+    expect(result.threadId).toBe("T1");
+    expect(second.sentMethods).toContain("initialize");
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("AppServerClient overload backpressure", () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+  });
+
+  it("retries an overloaded (-32001) request and returns the eventual success", async () => {
+    const fake = createFakeChild("complete");
+    let attempts = 0;
+    fake.onRequest = (message, emit) => {
+      if (message.method !== "mock/overload") return false;
+      attempts += 1;
+      if (attempts < 3) emit({ id: message.id, error: { code: -32001, message: "overloaded" } });
+      else emit({ id: message.id, result: { ok: true } });
+      return true;
+    };
+    spawnMock.mockReturnValue(fake.child);
+
+    const client = new AppServerClient();
+    await client.start();
+
+    const result = await client.request("mock/overload", {});
+    expect(result).toEqual({ ok: true });
+    expect(attempts).toBe(3);
+  });
+
+  it("gives up with an OverloadedError after the retry budget is exhausted", async () => {
+    const fake = createFakeChild("complete");
+    fake.onRequest = (message, emit) => {
+      if (message.method !== "mock/overload") return false;
+      emit({ id: message.id, error: { code: -32001, message: "overloaded" } });
+      return true;
+    };
+    spawnMock.mockReturnValue(fake.child);
+
+    const client = new AppServerClient();
+    await client.start();
+
+    await expect(client.request("mock/overload", {})).rejects.toBeInstanceOf(OverloadedError);
+    await expect(client.request("mock/overload", {})).rejects.toThrow(/overloaded/i);
+  });
+});
+
+describe("AppServerClient error taxonomy", () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+  });
+
+  it("maps a non-overload JSON-RPC error to a RequestError carrying the server message", async () => {
+    const fake = createFakeChild("complete");
+    fake.onRequest = (message, emit) => {
+      if (message.method !== "mock/fail") return false;
+      emit({ id: message.id, error: { code: -32603, message: "kaboom" } });
+      return true;
+    };
+    spawnMock.mockReturnValue(fake.child);
+
+    const client = new AppServerClient();
+    await client.start();
+
+    await expect(client.request("mock/fail", {})).rejects.toBeInstanceOf(RequestError);
+    await expect(client.request("mock/fail", {})).rejects.toThrow(/kaboom \(code -32603\)/);
+  });
+
+  it("fails with an actionable SpawnError when codex cannot be spawned", async () => {
+    const fake = createFakeChild("complete");
+    spawnMock.mockReturnValue(fake.child);
+
+    const client = new AppServerClient();
+    const started = client.start();
+    // ENOENT surfaces as an `error` event before the handshake can complete.
+    fake.spawnError(Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }));
+
+    await expect(started).rejects.toBeInstanceOf(SpawnError);
+    // The message must tell the caller how to diagnose it.
+    await expect(started).rejects.toThrow(/codex --version/);
   });
 });
