@@ -54,5 +54,5 @@ were implementation problems, not architectural ones.
   regenerated when the minimum supported codex version bumps (which the bridge
   probes at first use and fails on with an actionable message).
 - 1.0.0 ships as an npm publish so the installer's existing
-  `npx harness-bridge serve …` registration actually resolves; registering an
+  `npx @rbutera/harness-bridge serve …` registration actually resolves; registering an
   absolute path into a dev checkout's `dist/` is a dev-only setup.

@@ -1,5 +1,5 @@
 {
-  "name": "harness-bridge",
+  "name": "@rbutera/harness-bridge",
   "version": "1.0.0",
   "description": "Cross-harness MCP connector for coding agents",
   "keywords": [

@@ -34,22 +34,22 @@ Only connect Harness Bridge to projects and harnesses you trust with the permiss
 Configure both routes and install the bundled skills and Codex teammate agent:
 
 ```bash
-npx harness-bridge setup
+npx @rbutera/harness-bridge setup
 ```
 
 Configure one route without installing extras:
 
 ```bash
-npx harness-bridge connect claude --to codex
-npx harness-bridge connect codex --to claude
+npx @rbutera/harness-bridge connect claude --to codex
+npx @rbutera/harness-bridge connect codex --to claude
 ```
 
 The compatibility forms remain available:
 
 ```bash
-npx harness-bridge setup claude
-npx harness-bridge setup codex
-npx harness-bridge setup --skip-extras
+npx @rbutera/harness-bridge setup claude
+npx @rbutera/harness-bridge setup codex
+npx @rbutera/harness-bridge setup --skip-extras
 ```
 
 `setup claude` means “configure Claude Code as the calling harness”; `setup codex` configures Codex as the caller.
@@ -59,7 +59,7 @@ npx harness-bridge setup --skip-extras
 ### Claude Code calls Codex
 
 ```bash
-claude mcp add codex -s user -- npx harness-bridge serve codex
+claude mcp add codex -s user -- npx @rbutera/harness-bridge serve codex
 ```
 
 Project-local `.mcp.json`:
@@ -141,9 +141,9 @@ Thread state lives in Codex's own storage, so resume works across bridge restart
 Install them individually with:
 
 ```bash
-npx harness-bridge install skill claude --global
-npx harness-bridge install skill codex --global
-npx harness-bridge install agent --global
+npx @rbutera/harness-bridge install skill claude --global
+npx @rbutera/harness-bridge install skill codex --global
+npx @rbutera/harness-bridge install agent --global
 ```
 
 Use `--local` instead to install into the current project.
@@ -168,7 +168,7 @@ The **app-server backend is the default**. It keeps one persistent Codex process
 To opt back into the legacy `codex exec` backend (one subprocess per call):
 
 ```bash
-HARNESS_BRIDGE_CODEX_BACKEND=exec npx harness-bridge serve codex
+HARNESS_BRIDGE_CODEX_BACKEND=exec npx @rbutera/harness-bridge serve codex
 ```
 
 The legacy `CODEX_BRIDGE_BACKEND` name is also accepted, and the value `app-server` remains valid as an explicit no-op. Both backends use the same unrestricted execution policy. Threads created under one backend are not guaranteed to resume under the other.

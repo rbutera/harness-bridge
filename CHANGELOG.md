@@ -9,7 +9,7 @@
 
 ### Added
 
-- First npm publish, so `npx harness-bridge …` registrations emitted by the installer now resolve.
+- First npm publish, as `@rbutera/harness-bridge` (npm rejects the unscoped name as too similar to the unrelated `harnessbridge` package), so `npx -y @rbutera/harness-bridge …` registrations emitted by the installer now resolve.
 
 ### Changed
 

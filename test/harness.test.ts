@@ -15,7 +15,9 @@ describe("harness metadata", () => {
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { name: string; version: string };
 
-    expect(PRODUCT_NAME).toBe(packageJson.name);
+    // The npm package is scoped (@rbutera/harness-bridge); the runtime identity
+    // stays the unscoped tail so MCP server names read `harness-bridge-codex`.
+    expect(packageJson.name.split("/").at(-1)).toBe(PRODUCT_NAME);
     expect(PRODUCT_TITLE).toBe("Harness Bridge");
     expect(PRODUCT_VERSION).toBe(packageJson.version);
   });

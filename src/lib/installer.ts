@@ -137,7 +137,8 @@ const CLAUDE_MCP_ARGS = [
   "user",
   "--",
   "npx",
-  "harness-bridge",
+  "-y",
+  "@rbutera/harness-bridge",
   "serve",
   "codex",
 ];
@@ -168,7 +169,7 @@ export async function setupClaude(): Promise<void> {
     } else {
       console.error(`  Failed: ${msg}`);
       console.error(
-        "  You can register manually: claude mcp add codex -s user -- npx harness-bridge serve codex",
+        "  You can register manually: claude mcp add codex -s user -- npx -y @rbutera/harness-bridge serve codex",
       );
     }
   }
@@ -176,7 +177,7 @@ export async function setupClaude(): Promise<void> {
 
 const CODEX_TOML_SECTION = `[mcp_servers.claude]
 command = "npx"
-args = ["harness-bridge", "serve", "claude"]
+args = ["-y", "@rbutera/harness-bridge", "serve", "claude"]
 tool_timeout_sec = 600
 `;
 

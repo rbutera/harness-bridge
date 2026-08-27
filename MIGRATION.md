@@ -34,7 +34,7 @@ The id is Codex's real thread id, persisted in Codex's own storage, so resume su
 The app-server backend is now the default (previously it was opt-in and `exec` was the default). To keep the old `codex exec` behavior:
 
 ```bash
-HARNESS_BRIDGE_CODEX_BACKEND=exec npx harness-bridge serve codex
+HARNESS_BRIDGE_CODEX_BACKEND=exec npx @rbutera/harness-bridge serve codex
 ```
 
 The value `app-server` is still accepted as an explicit no-op, and the legacy `CODEX_BRIDGE_BACKEND` name still works. Threads created under one backend are not guaranteed to resume under the other.
@@ -45,7 +45,7 @@ The default app-server path needs codex 0.147.0 or newer. A missing or too-old c
 
 ### First npm publish
 
-1.0.0 is the first npm publish, so `npx harness-bridge …` registrations (which the installer already emits) now resolve to the published package.
+1.0.0 is the first npm publish, so `npx @rbutera/harness-bridge …` registrations (which the installer already emits) now resolve to the published package.
 
 ## Package and commands
 
@@ -64,14 +64,14 @@ harness-bridge
 For example:
 
 ```bash
-npx harness-bridge setup
+npx @rbutera/harness-bridge setup
 ```
 
-The `ccb-claude`, `ccb-codex`, and `claude-codex-bridge` binary aliases remain in the new package for compatibility with global installs. Running `npx claude-codex-bridge`, however, still resolves the separately owned upstream npm package; use `npx harness-bridge`.
+The `ccb-claude`, `ccb-codex`, and `claude-codex-bridge` binary aliases remain in the new package for compatibility with global installs. Running `npx claude-codex-bridge`, however, still resolves the separately owned upstream npm package; use `npx @rbutera/harness-bridge`.
 
 ## MCP configuration
 
-Running `npx harness-bridge setup` will offer to replace existing `codex` and `claude` MCP registrations with commands that use the new package.
+Running `npx @rbutera/harness-bridge setup` will offer to replace existing `codex` and `claude` MCP registrations with commands that use the new package.
 
 For checked-in `.mcp.json` files and other manually managed configuration, change only the package command. Keep the MCP server names `codex` and `claude` unchanged.
 
