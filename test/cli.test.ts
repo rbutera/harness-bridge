@@ -4,6 +4,7 @@ import { execCommand } from "../src/lib/exec-runner.js";
 
 const CLI_PATH = new URL("../src/cli.ts", import.meta.url).pathname;
 const TSX_CLI_PATH = createRequire(import.meta.url).resolve("tsx/cli");
+const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
 
 function runCli(args: string[]) {
   return execCommand({
@@ -17,7 +18,7 @@ describe("cli", { timeout: 10_000 }, () => {
   it("reports the package version", async () => {
     const result = await runCli(["--version"]);
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("0.4.1");
+    expect(result.stdout.trim()).toBe(packageJson.version);
   });
 
   it("shows help with available commands when no subcommand given", async () => {
