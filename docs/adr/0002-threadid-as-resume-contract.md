@@ -1,4 +1,4 @@
-# threadId is the resume contract; the threadKey registry is deleted
+# threadId is the codex resume contract; the threadKey registry goes
 
 ---
 
@@ -7,10 +7,12 @@ date: 2026-08-27
 
 ---
 
-Tools return the app-server's real `threadId` in their results, and callers pass
-`threadId` back to resume a conversation. The caller-chosen `threadKey` parameter
-and the in-memory `SessionRegistry` mapping keys to thread ids are removed in
-1.0.0 (a breaking tool-API change, recorded in MIGRATION.md).
+The codex tools return the app-server's real `threadId` in their results, and
+callers pass `threadId` back to resume a conversation. The caller-chosen
+`threadKey` parameter is removed from the codex tools in 1.0.0 (a breaking
+tool-API change, recorded in MIGRATION.md). The in-memory `SessionRegistry`
+survives only for the claude adapter, whose tools keep `threadKey` this release;
+extending the same id-as-contract change to it is expected follow-up work.
 
 The mapping had to live somewhere, and every home for it was bad: the in-memory
 map died with each bridge process; a state file on disk was a second source of

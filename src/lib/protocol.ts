@@ -28,6 +28,7 @@ export type { ThreadResumeParams } from "../generated/v2/ThreadResumeParams.js";
 export type { TurnStartParams } from "../generated/v2/TurnStartParams.js";
 export type { TurnInterruptParams } from "../generated/v2/TurnInterruptParams.js";
 export type { ThreadDeleteParams } from "../generated/v2/ThreadDeleteParams.js";
+export type { ThreadUnsubscribeParams } from "../generated/v2/ThreadUnsubscribeParams.js";
 export type { SandboxMode } from "../generated/v2/SandboxMode.js";
 export type { SandboxPolicy } from "../generated/v2/SandboxPolicy.js";
 import type { TokenUsageBreakdown } from "../generated/v2/TokenUsageBreakdown.js";
@@ -40,6 +41,7 @@ export const Method = {
   turnStart: "turn/start",
   turnInterrupt: "turn/interrupt",
   threadDelete: "thread/delete",
+  threadUnsubscribe: "thread/unsubscribe",
 } as const;
 
 /** Wire notification method names the client reacts to (see ServerNotification). */

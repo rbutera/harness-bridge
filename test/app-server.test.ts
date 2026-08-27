@@ -124,50 +124,43 @@ describe("AppServerClient thread lifecycle", () => {
     spawnMock.mockReset();
   });
 
-  it("deletes a throwaway (keyless) thread so its MCP stack is torn down", async () => {
+  it("unsubscribes the thread after a completed turn so its MCP stack unloads", async () => {
     const fake = createFakeChild("complete");
     spawnMock.mockReturnValue(fake.child);
 
     const client = new AppServerClient();
-    const result = await client.runTurn({ prompt: "hi", keepThread: false });
+    const result = await client.runTurn({ prompt: "hi" });
 
     expect(result.threadId).toBe("T1");
     expect(fake.sentMethods).toContain("thread/start");
     expect(fake.sentMethods).toContain("turn/start");
-    // The whole point: a keyless turn must dispose its thread.
-    expect(fake.sentMethods).toContain("thread/delete");
-    const del = fake.sent.find((m) => m.method === "thread/delete");
-    expect((del?.params as Record<string, unknown>)?.["threadId"]).toBe("T1");
-  });
-
-  it("keeps a thread the caller will resume (keepThread) — no delete", async () => {
-    const fake = createFakeChild("complete");
-    spawnMock.mockReturnValue(fake.child);
-
-    const client = new AppServerClient();
-    await client.runTurn({ prompt: "hi", keepThread: true });
-
-    expect(fake.sentMethods).toContain("turn/start");
+    // Every turn ends by unsubscribing so the server can unload the thread's MCP
+    // stack, while the SQLite record stays resumable by id.
+    expect(fake.sentMethods).toContain("thread/unsubscribe");
+    const unsub = fake.sent.find((m) => m.method === "thread/unsubscribe");
+    expect((unsub?.params as Record<string, unknown>)?.["threadId"]).toBe("T1");
+    // thread/delete would destroy the thread and break the resume contract — it
+    // must never be sent.
     expect(fake.sentMethods).not.toContain("thread/delete");
   });
 
-  it("disposes the thread when the turn errors", async () => {
+  it("unsubscribes the thread after a failed turn, and never deletes it", async () => {
     const fake = createFakeChild("error");
     spawnMock.mockReturnValue(fake.child);
 
     const client = new AppServerClient();
-    await expect(client.runTurn({ prompt: "hi", keepThread: false })).rejects.toThrow(/boom/);
-    // Even a kept thread would be freed here: the turn failed, so it is abandoned.
-    expect(fake.sentMethods).toContain("thread/delete");
+    await expect(client.runTurn({ prompt: "hi" })).rejects.toThrow(/boom/);
+    expect(fake.sentMethods).toContain("thread/unsubscribe");
+    expect(fake.sentMethods).not.toContain("thread/delete");
   });
 
-  it("keepThread thread is still disposed when the turn errors", async () => {
+  it("attaches the created thread id to a turn error so the caller can resume it", async () => {
     const fake = createFakeChild("error");
     spawnMock.mockReturnValue(fake.child);
 
     const client = new AppServerClient();
-    await expect(client.runTurn({ prompt: "hi", keepThread: true })).rejects.toThrow(/boom/);
-    expect(fake.sentMethods).toContain("thread/delete");
+    const error = await client.runTurn({ prompt: "hi" }).catch((e: unknown) => e);
+    expect((error as { threadId?: string }).threadId).toBe("T1");
   });
 });
 
@@ -212,7 +205,7 @@ describe("AppServerClient crash recovery", () => {
 
     // The client reset on the crash, so the next call spawns a fresh server and
     // re-runs the initialize handshake rather than reusing the dead child.
-    const result = await client.runTurn({ prompt: "hi", keepThread: false });
+    const result = await client.runTurn({ prompt: "hi" });
     expect(result.threadId).toBe("T1");
     expect(second.sentMethods).toContain("initialize");
     expect(spawnMock).toHaveBeenCalledTimes(2);

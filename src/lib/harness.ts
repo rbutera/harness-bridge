@@ -40,6 +40,12 @@ export const HARNESSES = {
   },
 } as const satisfies Record<HarnessId, HarnessDescriptor>;
 
+/**
+ * Claude adapter only. The claude tools still take a caller-chosen conversation
+ * key backed by an in-memory SessionRegistry. The codex adapter dropped this in
+ * 1.0 for the threadId resume contract (see THREAD_ID_DESCRIPTION in
+ * codex-server.ts and docs/adr/0002).
+ */
 export const CONVERSATION_KEY_DESCRIPTION =
   "Optional key enabling multi-turn continuity. Calls sharing a key use the same harness " +
   "conversation and are serialized. Omit it for independent one-shot calls, including parallel reviews.";

@@ -146,8 +146,10 @@ describe("KeyedMutex", () => {
 
 describe("keyed continuity under concurrency (the race this fixes)", () => {
   /**
-   * Models what `runCodex` does with a threadKey: resolve, run a turn, then
-   * record the thread. Without a lock these interleave.
+   * Models the claude adapter's keyed read-modify-write: resolve a caller key to
+   * a session, run a turn, then record the resulting session. Without a lock two
+   * concurrent calls on one key interleave. (The codex adapter dropped this in 1.0
+   * for the threadId contract; the mutex there now serialises turns on one thread.)
    */
   async function call(
     registry: SessionRegistry,

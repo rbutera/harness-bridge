@@ -20,11 +20,11 @@ import {
   type ErrorNotification,
   type InitializeParams,
   type ItemNotification,
-  type ThreadDeleteParams,
   type ThreadItemView,
   type ThreadResumeParams,
   type ThreadStartParams,
   type ThreadStartedResult,
+  type ThreadUnsubscribeParams,
   type TokenUsageNotification,
   type TurnInterruptParams,
   type TurnStartParams,
@@ -45,9 +45,8 @@ import {
  * Threads are first-class in the protocol, so concurrency is a protocol feature
  * rather than something the caller works around.
  *
- * Enable with `HARNESS_BRIDGE_CODEX_BACKEND=app-server`. It ships disabled: the exec
- * path stays the default until this has run in anger, and `codex app-server` is
- * still marked experimental in the CLI.
+ * This is the default backend as of 1.0. Set `HARNESS_BRIDGE_CODEX_BACKEND=exec`
+ * to fall back to the `codex exec` path (see `isAppServerEnabled`).
  *
  * The protocol edge is typed against the generated bindings (src/generated, via
  * src/lib/protocol.ts) rather than hand-shaped `unknown` access, so a wrong field
@@ -66,9 +65,15 @@ import {
 export const BACKEND_ENV_VAR = "HARNESS_BRIDGE_CODEX_BACKEND";
 export const LEGACY_BACKEND_ENV_VAR = "CODEX_BRIDGE_BACKEND";
 
-/** True when the app-server backend has been explicitly opted into. */
+/**
+ * True when the app-server backend is active. It is the default as of 1.0, so
+ * this returns true unless the caller has explicitly opted back into exec with
+ * `HARNESS_BRIDGE_CODEX_BACKEND=exec` (or the legacy `CODEX_BRIDGE_BACKEND=exec`).
+ * The value `app-server` is still accepted as an explicit no-op for anyone who
+ * pinned it under the old default.
+ */
 export function isAppServerEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  return (env[BACKEND_ENV_VAR] ?? env[LEGACY_BACKEND_ENV_VAR]) === "app-server";
+  return (env[BACKEND_ENV_VAR] ?? env[LEGACY_BACKEND_ENV_VAR]) !== "exec";
 }
 
 /**
@@ -91,9 +96,10 @@ function resolveRequestTimeoutMs(env: Record<string, string | undefined> = proce
 }
 
 /**
- * Best-effort thread disposal must never hold up a completed turn. If the server
- * is too wedged to answer a `thread/delete` in this window, the leaked stack is a
- * smaller problem than blocking the caller, so we give up and log.
+ * Best-effort thread unsubscribe must never hold up a completed turn. If the
+ * server is too wedged to answer a `thread/unsubscribe` in this window, the
+ * leaked stack is a smaller problem than blocking the caller, so we give up and
+ * log.
  */
 const DISPOSE_TIMEOUT_MS = 10_000;
 
@@ -127,17 +133,6 @@ export interface TurnOptions {
   effort?: string;
   /** Resume this thread instead of starting a new one. */
   resumeThreadId?: string | null;
-  /**
-   * Keep the thread alive after the turn so a later call can resume it.
-   *
-   * Defaults to disposing the thread. The app-server spawns a full MCP stack —
-   * one child process per configured server — for each thread it starts, and
-   * terminates those children only when the thread is dropped. A caller that
-   * starts a thread, runs one turn, and walks away therefore leaks an entire MCP
-   * stack every time. Only a caller that will actually resume the thread should
-   * keep it.
-   */
-  keepThread?: boolean;
   progress?: ProgressReporter;
 }
 
@@ -445,17 +440,20 @@ export class AppServerClient {
         },
       );
     } catch (error) {
-      // The thread is abandoned now — free its MCP stack instead of leaking it.
-      await this.disposeThread(threadId);
+      // Detach the thread's MCP stack, then hand the id back with the error so the
+      // caller can still surface a resumable threadId (the SQLite record survives
+      // an unsubscribe). See `unsubscribeThread` for why this is not a delete.
+      await this.unsubscribeThread(threadId);
+      if (error instanceof Error) (error as Error & { threadId?: string }).threadId = threadId;
       throw error;
     } finally {
       unsubscribe();
     }
 
-    // A throwaway thread (no caller will resume it) is deleted so the app-server
-    // drops it and terminates the per-thread MCP servers it spawned. Skipping this
-    // is the whole respawn-without-reap leak: one abandoned MCP stack per call.
-    if (!options.keepThread) await this.disposeThread(threadId);
+    // Unsubscribe after every completed turn so the app-server can unload the
+    // thread's MCP stack. The thread stays resumable by id, which is exactly the
+    // resume contract — so this runs unconditionally, not just for throwaway calls.
+    await this.unsubscribeThread(threadId);
     return result;
   }
 
@@ -465,23 +463,26 @@ export class AppServerClient {
   }
 
   /**
-   * Delete a thread we are finished with. The app-server terminates that thread's
-   * MCP servers when the thread is dropped, so this is what stops a throwaway call
-   * from leaking a full MCP stack. Best-effort by design: a failure here must
-   * never surface to the caller or hold up a completed turn, so it is bounded by
-   * a short timeout and swallowed.
+   * Detach from a thread we are finished with for now. Unsubscribe lets the
+   * app-server unload the thread's MCP stack — the per-thread child processes it
+   * spawned — while leaving the thread's SQLite record intact and resumable by id.
+   * That is deliberately not `thread/delete`, which would destroy the thread and
+   * break the threadId resume contract; and it is not "keep it loaded", which
+   * leaks the MCP stack (the v0.4.1 scar). Best-effort by design: a failure here
+   * must never surface to the caller or hold up a completed turn, so it is bounded
+   * by a short timeout and swallowed.
    */
-  async disposeThread(threadId: string): Promise<void> {
+  async unsubscribeThread(threadId: string): Promise<void> {
     if (!this.#child) return;
     try {
       await this.request(
-        Method.threadDelete,
-        { threadId } satisfies ThreadDeleteParams,
+        Method.threadUnsubscribe,
+        { threadId } satisfies ThreadUnsubscribeParams,
         DISPOSE_TIMEOUT_MS,
       );
     } catch (error) {
       logger.debug(
-        `thread/delete failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
+        `thread/unsubscribe failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
