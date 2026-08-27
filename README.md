@@ -26,7 +26,7 @@ Only connect Harness Bridge to projects and harnesses you trust with the permiss
 ## Prerequisites
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), installed and authenticated
-- [OpenAI Codex CLI](https://developers.openai.com/codex/cli/), installed and authenticated
+- [OpenAI Codex CLI](https://developers.openai.com/codex/cli/), installed and authenticated — version 0.147.0 or newer for the default app-server backend (older versions still work with `HARNESS_BRIDGE_CODEX_BACKEND=exec`)
 - Node.js 18 or newer
 
 ## Quick start
@@ -100,13 +100,35 @@ Each adapter exposes the same task categories with a harness-specific prefix:
 | Performance planning | `codex_plan_perf`    | `claude_plan_perf`    |
 | Implementation       | `codex_implement`    | `claude_implement`    |
 
-All tools accept `workingDirectory`. Both adapters also accept an optional `threadKey` for deliberate multi-turn continuity:
+All tools accept `workingDirectory`. Both adapters support deliberate multi-turn continuity, but through different parameters:
 
-- Omit `threadKey` for independent calls. This is the concurrency-safe default.
-- Reuse a stable key to continue one conversation.
-- Calls sharing a key are serialized; different keys and keyless calls remain independent.
+- **Codex tools** accept an optional `threadId`. Omit it to start a fresh thread; pass back the `threadId` a prior call returned to continue that conversation.
+- **Claude tools** accept an optional `threadKey`. Omit it for independent calls; reuse a stable key to continue one conversation.
+
+Either way, keyless (or threadId-less) calls are independent and run fully parallel; calls that continue the same conversation are serialized so two turns never race one thread.
 
 For Codex, omit `model` unless a specific override is required so the current default from `~/.codex/config.toml` applies.
+
+### Continuing a Codex conversation
+
+Every Codex response that carries a thread ends with a trailing line:
+
+```text
+threadId: 0199a1b2-c3d4-...
+```
+
+Echo that id back on the next call to continue the same thread:
+
+```jsonc
+// first call — omit threadId to start fresh
+{ "prompt": "Summarize the auth module." }
+// response ends with:  threadId: 0199a1b2-c3d4-...
+
+// follow-up — pass the id back to continue
+{ "prompt": "Now suggest a refactor.", "threadId": "0199a1b2-c3d4-..." }
+```
+
+Thread state lives in Codex's own storage, so resume works across bridge restarts, Claude sessions, and reboots.
 
 ## Bundled skills and agent
 
@@ -135,17 +157,21 @@ Use `--local` instead to install into the current project.
 | `HARNESS_BRIDGE_DEBUG`                | Enable debug logging on stderr                | unset     |
 | `HARNESS_BRIDGE_DEPTH`                | Recursion depth propagated to child harnesses | `0`       |
 | `HARNESS_BRIDGE_CODEX_MAX_CONCURRENT` | Maximum simultaneous `codex exec` processes   | `4`       |
-| `HARNESS_BRIDGE_CODEX_BACKEND`        | `exec` or opt-in `app-server`                 | `exec`    |
+| `HARNESS_BRIDGE_CODEX_BACKEND`        | `app-server` (default) or opt-out `exec`      | `app-server` |
 
 The previous `BRIDGE_*` and `CODEX_BRIDGE_*` names remain accepted for compatibility. New configuration should use `HARNESS_BRIDGE_*`.
 
-### Codex app-server backend
+### Codex backends
+
+The **app-server backend is the default**. It keeps one persistent Codex process, supports first-class threads, and can interrupt active turns. After every turn the bridge unsubscribes the thread so the app-server unloads its per-thread MCP stack while the thread stays resumable. It requires codex >= 0.147.0; a missing or too-old codex produces an actionable error naming the fix.
+
+To opt back into the legacy `codex exec` backend (one subprocess per call):
 
 ```bash
-HARNESS_BRIDGE_CODEX_BACKEND=app-server npx harness-bridge serve codex
+HARNESS_BRIDGE_CODEX_BACKEND=exec npx harness-bridge serve codex
 ```
 
-The experimental app-server backend keeps one persistent Codex process, supports first-class threads, and can interrupt active turns. It uses the same unrestricted execution policy as the default exec backend.
+The legacy `CODEX_BRIDGE_BACKEND` name is also accepted, and the value `app-server` remains valid as an explicit no-op. Both backends use the same unrestricted execution policy. Threads created under one backend are not guaranteed to resume under the other.
 
 ## Migrating from claude-codex-bridge
 

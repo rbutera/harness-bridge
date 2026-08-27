@@ -5,29 +5,34 @@ import { execCommand, resolveTimeoutMs, TIMEOUT_ENV_VAR } from "./lib/exec-runne
 import { parseCodexOutput } from "./lib/codex-output-parser.js";
 import { buildExplainCodePrompt, buildPlanPerfPrompt } from "./lib/prompt-builder.js";
 import { createProgressReporter, logger, type ProgressReporter } from "./lib/logger.js";
-import { SessionRegistry } from "./lib/session-registry.js";
 import { Semaphore, resolveMaxConcurrent } from "./lib/semaphore.js";
 import { KeyedMutex } from "./lib/keyed-mutex.js";
 import { buildCodexArgs } from "./lib/codex-args.js";
+import { formatCodexResponse } from "./lib/codex-response.js";
 import { AppServerClient, isAppServerEnabled } from "./lib/app-server.js";
-import {
-  CONVERSATION_KEY_DESCRIPTION,
-  createHarnessServer,
-  HARNESSES,
-  type HarnessAdapter,
-} from "./lib/harness.js";
+import { createHarnessServer, HARNESSES, type HarnessAdapter } from "./lib/harness.js";
 import { CODEX_MODELS } from "./lib/types.js";
 import type { CodexResult } from "./lib/types.js";
 
-const threads = new SessionRegistry();
+/**
+ * Continue a previous Codex conversation by passing back the `threadId` a prior
+ * call returned. Lives here rather than in harness.ts because the threadId
+ * contract is codex-specific: the claude adapter still uses a caller-chosen
+ * conversation key (see CONVERSATION_KEY_DESCRIPTION in harness.ts).
+ */
+const THREAD_ID_DESCRIPTION =
+  "Continue a previous Codex conversation: pass the threadId returned by an earlier call. " +
+  "Omit to start a fresh thread.";
 
 /** Caps concurrent `codex exec` subprocesses. See semaphore.ts. */
 const execSlots = new Semaphore(resolveMaxConcurrent());
 
 /**
- * Serializes calls that share a `threadKey`, so resolve/run/remember is atomic
- * per key. Acquired OUTSIDE `execSlots`; that ordering is fixed, and semaphore
- * holders never take a key lock, so the two cannot deadlock. See keyed-mutex.ts.
+ * Serializes calls that resume the same explicit `threadId`, so two concurrent
+ * turns never run against one thread (a conversation is inherently sequential).
+ * Calls without a threadId are independent and run fully parallel. Acquired
+ * OUTSIDE `execSlots`; that ordering is fixed, and semaphore holders never take a
+ * key lock, so the two cannot deadlock. See keyed-mutex.ts.
  */
 const keyLocks = new KeyedMutex();
 
@@ -75,22 +80,23 @@ function reportCodexEvent(line: string, progress: ProgressReporter): void {
 /**
  * Lazily-created app-server connection, shared across calls.
  *
- * Not created at module load: the exec backend is the default, and spawning an
- * app-server nobody asked for would cost a process on every bridge start.
+ * Not created at module load: even though the app-server is the default backend,
+ * a bridge start where no codex tool is ever called should not pay for a spawned
+ * process. The connection is created on first use instead.
  */
 let appServer: AppServerClient | null = null;
 
 /**
- * Phase 2 path. Same inputs, same `CodexResult` out, so it is a drop-in swap.
- *
- * Thread bookkeeping stays identical to the exec path.
+ * App-server path. Same inputs, same `CodexResult` out, so it is a drop-in swap
+ * for the exec path. The caller's explicit `resumeThreadId` flows straight to
+ * `thread/resume`; the returned `CodexResult.threadId` is the id the caller
+ * echoes back to continue the conversation.
  */
 async function runViaAppServer(
   prompt: string,
   options: {
     workingDirectory?: string;
     model?: string;
-    threadKey?: string;
     resumeThreadId: string | null;
     progress?: ProgressReporter;
   },
@@ -98,28 +104,19 @@ async function runViaAppServer(
   appServer ??= new AppServerClient();
 
   try {
-    const result = await appServer.runTurn({
+    return await appServer.runTurn({
       prompt,
       cwd: options.workingDirectory,
       model: options.model,
       resumeThreadId: options.resumeThreadId,
-      // Keep the thread alive only when a caller can resume it (it has a
-      // threadKey). A keyless, throwaway call disposes its thread so the
-      // app-server tears down that thread's MCP stack instead of leaking it.
-      keepThread: Boolean(options.threadKey),
       progress: options.progress,
     });
-
-    if (result.threadId) {
-      threads.remember(options.threadKey, result.threadId);
-    }
-    return result;
   } catch (error) {
-    // Drop any remembered thread: resuming it after a failure would target a
-    // thread whose state we can no longer reason about.
-    threads.forget(options.threadKey);
+    // The turn failed. If a thread was created before it failed, runTurn attaches
+    // its id to the error; surface that so the caller can still resume it.
+    const threadId = (error as { threadId?: string })?.threadId ?? null;
     return {
-      threadId: null,
+      threadId,
       agentMessage: "",
       fileChanges: [],
       commandsExecuted: [],
@@ -132,23 +129,23 @@ async function runViaAppServer(
 interface CodexRunOptions {
   workingDirectory?: string;
   model?: string;
-  threadKey?: string;
+  /** Explicit thread to resume; echoed back from a prior call's response. */
+  threadId?: string;
   progress?: ProgressReporter;
 }
 
 async function runCodex(prompt: string, options: CodexRunOptions = {}): Promise<CodexResult> {
-  // Resolving the key, running the turn, and recording the resulting thread is
-  // a read-modify-write. Without a per-key lock, two concurrent calls sharing a
-  // threadKey either start two threads and lose one (new key), or resume the
-  // same thread at once (existing key). Keyless calls — the default — skip the
-  // lock entirely and stay fully parallel.
-  const key = options.threadKey;
+  // Serialize concurrent turns that target the same explicit thread: a
+  // conversation is sequential, so two turns resuming one thread at once would
+  // race. Calls without a threadId are independent and skip the lock, staying
+  // fully parallel (the default for one-shot reviews).
+  const key = options.threadId;
   if (!key) return runCodexUnlocked(prompt, options);
   return keyLocks.run(key, () => runCodexUnlocked(prompt, options));
 }
 
 async function runCodexUnlocked(prompt: string, options: CodexRunOptions): Promise<CodexResult> {
-  const resumeThreadId = threads.resolve(options.threadKey);
+  const resumeThreadId = options.threadId ?? null;
 
   // Backend swap is invisible above this line: the MCP tool surface, and so
   // every caller and the codex-teammate agent, is identical either way.
@@ -220,17 +217,10 @@ async function runCodexUnlocked(prompt: string, options: CodexRunOptions): Promi
   options.progress?.report("Parsing response...");
   const parsed = parseCodexOutput(result.stdout);
 
-  // Only remember the thread when the caller opted into continuity with a key.
-  // Without a key this is a no-op, so concurrent callers cannot stomp each other.
+  // The parsed thread id is surfaced verbatim to the caller by formatCodexResponse;
+  // there is no server-side registry to update — the caller owns the id now.
   if (parsed.threadId) {
-    threads.remember(options.threadKey, parsed.threadId);
-    if (options.threadKey) {
-      logger.debug(`Stored thread ${parsed.threadId} for key '${options.threadKey}'`);
-    }
-  } else if (options.threadKey) {
-    // Codex returned no thread id, so a later resume under this key would target
-    // a stale thread. Drop it and let the next call start clean.
-    threads.forget(options.threadKey);
+    logger.debug(`Codex turn produced thread ${parsed.threadId}`);
   }
 
   // Check stderr for API key issues
@@ -248,43 +238,6 @@ async function runCodexUnlocked(prompt: string, options: CodexRunOptions): Promi
   }
 
   return parsed;
-}
-
-// Safety limit to prevent exceeding MCP response token limits.
-const MAX_RESPONSE_CHARS = 80_000;
-
-function formatCodexResponse(parsed: CodexResult): {
-  content: Array<{ type: "text"; text: string }>;
-  isError?: boolean;
-} {
-  if (parsed.errors.length > 0 && !parsed.agentMessage) {
-    return {
-      content: [{ type: "text", text: `Error: ${parsed.errors.join("; ")}` }],
-      isError: true,
-    };
-  }
-
-  let text = parsed.agentMessage;
-
-  if (parsed.fileChanges.length > 0) {
-    text += "\n\n**Files changed:**\n";
-    for (const fc of parsed.fileChanges) {
-      text += `- ${fc.kind}: ${fc.path}\n`;
-    }
-  }
-
-  if (parsed.commandsExecuted.length > 0) {
-    text += "\n\n**Commands executed:**\n";
-    for (const cmd of parsed.commandsExecuted) {
-      text += `- \`${cmd.command}\` (exit: ${cmd.exitCode})\n`;
-    }
-  }
-
-  if (text.length > MAX_RESPONSE_CHARS) {
-    text = text.slice(0, MAX_RESPONSE_CHARS) + "\n\n...[response truncated]";
-  }
-
-  return { content: [{ type: "text", text }] };
 }
 
 const codexAdapter: HarnessAdapter<CodexResult, CodexRunOptions> = {
@@ -314,15 +267,15 @@ server.registerTool(
         .describe(
           "Override the Codex model. OMIT this unless explicitly told otherwise: when omitted, the Codex CLI uses the default from ~/.codex/config.toml, which is kept current. This enum may lag behind newly released models.",
         ),
-      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
+      threadId: z.string().optional().describe(THREAD_ID_DESCRIPTION),
     },
   },
-  async ({ prompt, workingDirectory, model, threadKey }, extra) => {
+  async ({ prompt, workingDirectory, model, threadId }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
       model,
-      threadKey,
+      threadId,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -347,10 +300,10 @@ server.registerTool(
         .describe("Focus on: bugs, performance, style, security, etc."),
       context: z.string().optional().describe("Additional context about the codebase or changes"),
       workingDirectory: z.string().optional(),
-      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
+      threadId: z.string().optional().describe(THREAD_ID_DESCRIPTION),
     },
   },
-  async ({ target, focusAreas, context, workingDirectory, threadKey }, extra) => {
+  async ({ target, focusAreas, context, workingDirectory, threadId }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     let prompt = `Review the following code changes. Provide specific, actionable feedback with line references.\n\nTarget: ${target}`;
     if (focusAreas) prompt += `\n\nFocus areas: ${focusAreas}`;
@@ -358,7 +311,7 @@ server.registerTool(
 
     const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      threadKey,
+      threadId,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -379,10 +332,10 @@ server.registerTool(
         .optional()
         .describe("Known constraints: timeline, tech stack, compatibility"),
       workingDirectory: z.string().optional(),
-      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
+      threadId: z.string().optional().describe(THREAD_ID_DESCRIPTION),
     },
   },
-  async ({ plan, codebasePath, constraints, workingDirectory, threadKey }, extra) => {
+  async ({ plan, codebasePath, constraints, workingDirectory, threadId }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     let prompt = `Critique this implementation plan. Identify gaps, risks, missing edge cases, and suggest improvements.\n\nPlan:\n${plan}`;
     if (codebasePath) prompt += `\n\nRelevant codebase: ${codebasePath}`;
@@ -390,7 +343,7 @@ server.registerTool(
 
     const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      threadKey,
+      threadId,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -414,15 +367,15 @@ server.registerTool(
         .describe("Depth of explanation: overview, detailed, or full execution trace"),
       context: z.string().optional().describe("Additional context about the codebase"),
       workingDirectory: z.string().optional(),
-      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
+      threadId: z.string().optional().describe(THREAD_ID_DESCRIPTION),
     },
   },
-  async ({ target, depth, context, workingDirectory, threadKey }, extra) => {
+  async ({ target, depth, context, workingDirectory, threadId }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const prompt = buildExplainCodePrompt({ target, depth, context });
     const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      threadKey,
+      threadId,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -447,15 +400,15 @@ server.registerTool(
         .describe("Constraints: must not increase binary size, etc."),
       context: z.string().optional().describe("Additional context about usage patterns"),
       workingDirectory: z.string().optional(),
-      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
+      threadId: z.string().optional().describe(THREAD_ID_DESCRIPTION),
     },
   },
-  async ({ target, metrics, constraints, context, workingDirectory, threadKey }, extra) => {
+  async ({ target, metrics, constraints, context, workingDirectory, threadId }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const prompt = buildPlanPerfPrompt({ target, metrics, constraints, context });
     const parsed = await codexAdapter.run(prompt, {
       workingDirectory,
-      threadKey,
+      threadId,
       progress,
     });
     return formatCodexResponse(parsed);
@@ -477,15 +430,15 @@ server.registerTool(
         .describe(
           "Override the Codex model. OMIT this unless explicitly told otherwise: when omitted, the Codex CLI uses the default from ~/.codex/config.toml, which is kept current. This enum may lag behind newly released models.",
         ),
-      threadKey: z.string().optional().describe(CONVERSATION_KEY_DESCRIPTION),
+      threadId: z.string().optional().describe(THREAD_ID_DESCRIPTION),
     },
   },
-  async ({ task, workingDirectory, model, threadKey }, extra) => {
+  async ({ task, workingDirectory, model, threadId }, extra) => {
     const progress = createProgressReporter(extra.sendNotification, extra._meta?.progressToken);
     const parsed = await codexAdapter.run(task, {
       workingDirectory,
       model,
-      threadKey,
+      threadId,
       progress,
     });
     return formatCodexResponse(parsed);

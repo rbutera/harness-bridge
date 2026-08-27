@@ -1,0 +1,4 @@
+# Generated codex app-server protocol bindings (see `pnpm generate:protocol`).
+# Checked in as source but authored by ts-rs, so oxfmt (which reads this file)
+# must not reformat or flag them.
+src/generated/

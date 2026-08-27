@@ -5,6 +5,31 @@ import { PRODUCT_NAME, PRODUCT_TITLE, PRODUCT_VERSION } from "./harness.js";
 import { logger, type ProgressReporter } from "./logger.js";
 import { resolveTimeoutMs } from "./exec-runner.js";
 import type { CodexResult } from "./types.js";
+import {
+  HandshakeError,
+  OverloadedError,
+  ProtocolError,
+  RequestTimeoutError,
+  ServerCrashedError,
+  SpawnError,
+  mapRequestError,
+} from "./app-server-errors.js";
+import {
+  Method,
+  Notification,
+  type ErrorNotification,
+  type InitializeParams,
+  type ItemNotification,
+  type ThreadItemView,
+  type ThreadResumeParams,
+  type ThreadStartParams,
+  type ThreadStartedResult,
+  type ThreadUnsubscribeParams,
+  type TokenUsageNotification,
+  type TurnInterruptParams,
+  type TurnStartParams,
+  type TurnStartedResult,
+} from "./protocol.js";
 
 /**
  * Phase 2 backend: drive Codex through `codex app-server` instead of spawning a
@@ -20,9 +45,12 @@ import type { CodexResult } from "./types.js";
  * Threads are first-class in the protocol, so concurrency is a protocol feature
  * rather than something the caller works around.
  *
- * Enable with `HARNESS_BRIDGE_CODEX_BACKEND=app-server`. It ships disabled: the exec
- * path stays the default until this has run in anger, and `codex app-server` is
- * still marked experimental in the CLI.
+ * This is the default backend as of 1.0. Set `HARNESS_BRIDGE_CODEX_BACKEND=exec`
+ * to fall back to the `codex exec` path (see `isAppServerEnabled`).
+ *
+ * The protocol edge is typed against the generated bindings (src/generated, via
+ * src/lib/protocol.ts) rather than hand-shaped `unknown` access, so a wrong field
+ * name is a build error rather than a silently-dropped value.
  *
  * **Known behavioural difference, measured 2026-07-22.** `codex exec` refuses to
  * run outside a trusted git directory ("Not inside a trusted directory and
@@ -37,9 +65,15 @@ import type { CodexResult } from "./types.js";
 export const BACKEND_ENV_VAR = "HARNESS_BRIDGE_CODEX_BACKEND";
 export const LEGACY_BACKEND_ENV_VAR = "CODEX_BRIDGE_BACKEND";
 
-/** True when the app-server backend has been explicitly opted into. */
+/**
+ * True when the app-server backend is active. It is the default as of 1.0, so
+ * this returns true unless the caller has explicitly opted back into exec with
+ * `HARNESS_BRIDGE_CODEX_BACKEND=exec` (or the legacy `CODEX_BRIDGE_BACKEND=exec`).
+ * The value `app-server` is still accepted as an explicit no-op for anyone who
+ * pinned it under the old default.
+ */
 export function isAppServerEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  return (env[BACKEND_ENV_VAR] ?? env[LEGACY_BACKEND_ENV_VAR]) === "app-server";
+  return (env[BACKEND_ENV_VAR] ?? env[LEGACY_BACKEND_ENV_VAR]) !== "exec";
 }
 
 /**
@@ -62,13 +96,31 @@ function resolveRequestTimeoutMs(env: Record<string, string | undefined> = proce
 }
 
 /**
- * Best-effort thread disposal must never hold up a completed turn. If the server
- * is too wedged to answer a `thread/delete` in this window, the leaked stack is a
- * smaller problem than blocking the caller, so we give up and log.
+ * Best-effort thread unsubscribe must never hold up a completed turn. If the
+ * server is too wedged to answer a `thread/unsubscribe` in this window, the
+ * leaked stack is a smaller problem than blocking the caller, so we give up and
+ * log.
  */
 const DISPOSE_TIMEOUT_MS = 10_000;
 
+/**
+ * Retry budget for a request the server rejects as overloaded (JSON-RPC -32001).
+ * Overload is transient and the server stays alive, so the fix is to back off and
+ * resend, not to fail the call or tear the server down. Delays sit between
+ * attempts (so 3 attempts means two waits).
+ */
+const OVERLOAD_MAX_ATTEMPTS = 3;
+const OVERLOAD_BACKOFF_MS = [100, 400];
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
 interface Pending {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer?: ReturnType<typeof setTimeout>;
@@ -81,17 +133,6 @@ export interface TurnOptions {
   effort?: string;
   /** Resume this thread instead of starting a new one. */
   resumeThreadId?: string | null;
-  /**
-   * Keep the thread alive after the turn so a later call can resume it.
-   *
-   * Defaults to disposing the thread. The app-server spawns a full MCP stack —
-   * one child process per configured server — for each thread it starts, and
-   * terminates those children only when the thread is dropped. A caller that
-   * starts a thread, runs one turn, and walks away therefore leaks an entire MCP
-   * stack every time. Only a caller that will actually resume the thread (one
-   * holding a `threadKey`) should keep it.
-   */
-  keepThread?: boolean;
   progress?: ProgressReporter;
 }
 
@@ -109,6 +150,12 @@ export class AppServerClient {
   #notificationHandlers = new Set<(message: JsonRpcMessage) => void>();
   #nextId = 0;
   #ready: Promise<void> | null = null;
+  /**
+   * True once `initialize` has been answered. Distinguishes a child that dies
+   * mid-handshake (an old/missing subcommand — a `HandshakeError`) from one that
+   * crashes after it was working (a `ServerCrashedError`).
+   */
+  #initialized = false;
 
   /**
    * Spawn and initialize the app-server, at most once.
@@ -131,8 +178,14 @@ export class AppServerClient {
   }
 
   async #doStart(): Promise<void> {
-    const child = spawn("codex", ["app-server"], { stdio: ["pipe", "pipe", "pipe"] });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn("codex", ["app-server"], { stdio: ["pipe", "pipe", "pipe"] });
+    } catch (cause) {
+      throw new SpawnError(cause);
+    }
     this.#child = child;
+    this.#initialized = false;
 
     child.stdout.on("data", (chunk: Buffer) => {
       for (const message of this.#decoder.push(chunk.toString())) {
@@ -142,22 +195,29 @@ export class AppServerClient {
     child.stderr.on("data", (chunk: Buffer) => {
       logger.debug(`[app-server:stderr] ${chunk.toString().replace(/\n$/, "")}`);
     });
+    // A spawn-level failure (ENOENT when codex is not on PATH, EACCES, …) arrives
+    // as an `error` event, not `exit`, and the process never runs. Without this
+    // handler the pending `initialize` would hang until its timeout; instead we
+    // fail every waiter now with an actionable "is codex installed?" message.
+    child.on("error", (cause: Error) => {
+      this.#failAllPending(new SpawnError(cause));
+    });
     child.on("exit", (code: number | null) => {
-      // Fail every in-flight call rather than leaving callers hanging forever.
-      const error = new Error(`codex app-server exited with code ${code}`);
-      for (const pending of this.#pending.values()) {
-        if (pending.timer) clearTimeout(pending.timer);
-        pending.reject(error);
-      }
-      this.#pending.clear();
-      this.#child = null;
-      this.#ready = null;
+      // A child that exits before the handshake completes almost always means a
+      // codex too old to expose `app-server`; one that exits after means a crash.
+      // Either way every in-flight call is failed rather than left hanging.
+      const error = this.#initialized
+        ? new ServerCrashedError(code)
+        : new HandshakeError(`process exited with code ${code} during initialize`);
+      this.#failAllPending(error);
     });
 
-    await this.request("initialize", {
+    const params: InitializeParams = {
       clientInfo: { name: PRODUCT_NAME, title: PRODUCT_TITLE, version: PRODUCT_VERSION },
       capabilities: null,
-    });
+    };
+    await this.request(Method.initialize, params);
+    this.#initialized = true;
   }
 
   #dispatch(message: JsonRpcMessage): void {
@@ -167,7 +227,7 @@ export class AppServerClient {
       this.#pending.delete(message.id as number);
       if (pending.timer) clearTimeout(pending.timer);
       if (message.error) {
-        pending.reject(new Error(`${message.error.message} (code ${message.error.code})`));
+        pending.reject(mapRequestError(pending.method, message.error));
       } else {
         pending.resolve(message.result);
       }
@@ -177,45 +237,94 @@ export class AppServerClient {
   }
 
   /**
+   * Fail every in-flight request and reset the client so the next call spawns a
+   * fresh, re-initialized server. Called from the `error` and `exit` handlers and
+   * safe to run more than once (a cleared pending map makes a second call a
+   * no-op).
+   */
+  #failAllPending(error: Error): void {
+    for (const pending of this.#pending.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.#pending.clear();
+    this.#child = null;
+    this.#ready = null;
+    this.#initialized = false;
+  }
+
+  /**
    * Tear the app-server down after it stops answering, so the next call spawns a
    * fresh one rather than queueing behind a wedged process. Killing the child
-   * fires its `exit` handler, which rejects every remaining in-flight call.
+   * fires its `exit` handler, which fails every remaining in-flight call.
    */
   #markUnhealthy(): void {
     const child = this.#child;
     this.#child = null;
     this.#ready = null;
+    this.#initialized = false;
     child?.kill();
   }
 
   /**
-   * Issue a JSON-RPC request and await its response.
+   * Issue a JSON-RPC request and await its response, retrying on overload.
    *
-   * `timeoutMs` bounds the wait. A non-positive value disables the bound (used by
-   * callers that impose their own, longer, bound around a whole turn).
+   * `timeoutMs` bounds each attempt. A non-positive value disables the bound
+   * (used by callers that impose their own, longer, bound around a whole turn).
+   * Only overload (-32001) is retried, with bounded backoff; every other failure
+   * — timeout, crash, protocol error — propagates immediately.
    */
-  request(
+  async request<T = unknown>(
     method: string,
     params: unknown,
     timeoutMs = resolveRequestTimeoutMs(),
-  ): Promise<unknown> {
+  ): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.#sendOnce<T>(method, params, timeoutMs);
+      } catch (error) {
+        if (error instanceof OverloadedError && attempt < OVERLOAD_MAX_ATTEMPTS) {
+          const wait = OVERLOAD_BACKOFF_MS[attempt - 1] ?? OVERLOAD_BACKOFF_MS.at(-1) ?? 400;
+          await delay(wait);
+          continue;
+        }
+        // Report the attempts actually made rather than the mapper's placeholder.
+        if (error instanceof OverloadedError) throw new OverloadedError(method, attempt);
+        throw error;
+      }
+    }
+  }
+
+  #sendOnce<T>(method: string, params: unknown, timeoutMs: number): Promise<T> {
     const child = this.#child;
-    if (!child) return Promise.reject(new Error("app-server is not running"));
+    if (!child) return Promise.reject(new ServerCrashedError(null));
 
     const id = ++this.#nextId;
-    return new Promise<unknown>((resolve, reject) => {
-      const pending: Pending = { resolve, reject };
+    return new Promise<T>((resolve, reject) => {
+      const pending: Pending = {
+        method,
+        resolve: (value) => {
+          resolve(value as T);
+        },
+        reject,
+      };
       if (timeoutMs > 0) {
         pending.timer = setTimeout(() => {
           // Only act if we still own this id; a response may have raced in.
           if (!this.#pending.delete(id)) return;
-          reject(new Error(`app-server request '${method}' timed out after ${timeoutMs}ms`));
+          reject(new RequestTimeoutError(method, timeoutMs));
           this.#markUnhealthy();
         }, timeoutMs);
         pending.timer.unref?.();
       }
       this.#pending.set(id, pending);
-      child.stdin.write(encode({ id, method, params }));
+      try {
+        child.stdin.write(encode({ id, method, params }));
+      } catch (cause) {
+        this.#pending.delete(id);
+        if (pending.timer) clearTimeout(pending.timer);
+        reject(new ServerCrashedError(null, { cause }));
+      }
     });
   }
 
@@ -233,21 +342,21 @@ export class AppServerClient {
 
     const sandboxPolicy = unrestrictedSandboxPolicy();
 
-    const threadResult = (await (options.resumeThreadId
-      ? this.request("thread/resume", {
+    const started = options.resumeThreadId
+      ? await this.request<ThreadStartedResult>(Method.threadResume, {
           threadId: options.resumeThreadId,
           cwd: options.cwd,
           sandbox: "danger-full-access",
           model: options.model,
-        })
-      : this.request("thread/start", {
+        } satisfies ThreadResumeParams)
+      : await this.request<ThreadStartedResult>(Method.threadStart, {
           cwd: options.cwd,
           sandbox: "danger-full-access",
           model: options.model,
-        }))) as { thread?: { id?: string }; threadId?: string };
+        } satisfies ThreadStartParams);
 
-    const threadId = threadResult.threadId ?? threadResult.thread?.id;
-    if (!threadId) throw new Error("app-server returned no threadId");
+    const threadId = started.thread?.id;
+    if (!threadId) throw new ProtocolError("start response carried no thread id");
 
     const result: CodexResult = {
       threadId,
@@ -261,38 +370,47 @@ export class AppServerClient {
     let unsubscribe: () => void = () => {};
     const completion = new Promise<void>((resolve, reject) => {
       unsubscribe = this.#onNotification((message) => {
-        const params = (message.params ?? {}) as Record<string, unknown>;
-        // Ignore traffic belonging to other concurrent turns.
-        if (params["threadId"] && params["threadId"] !== threadId) return;
-
+        const params = message.params;
         switch (message.method) {
-          case "item/completed": {
-            this.#recordItem(result, params["item"] as Record<string, unknown> | undefined);
+          case Notification.itemCompleted: {
+            const notification = params as ItemNotification;
+            if (notification.threadId && notification.threadId !== threadId) return;
+            this.#recordItem(result, notification.item);
             break;
           }
-          case "item/started": {
-            const item = params["item"] as Record<string, unknown> | undefined;
-            if (item?.["type"]) options.progress?.report(String(item["type"]));
+          case Notification.itemStarted: {
+            const notification = params as ItemNotification;
+            if (notification.threadId && notification.threadId !== threadId) return;
+            if (notification.item?.type) options.progress?.report(notification.item.type);
             break;
           }
-          case "thread/tokenUsage/updated": {
-            const usage = params["usage"] as Record<string, number> | undefined;
-            if (usage) {
+          case Notification.tokenUsageUpdated: {
+            const notification = params as TokenUsageNotification;
+            if (notification.threadId && notification.threadId !== threadId) return;
+            const total = notification.tokenUsage?.total;
+            if (total) {
               result.usage = {
-                inputTokens: usage["inputTokens"] ?? 0,
-                outputTokens: usage["outputTokens"] ?? 0,
+                inputTokens: total.inputTokens ?? 0,
+                outputTokens: total.outputTokens ?? 0,
               };
             }
             break;
           }
-          case "turn/completed": {
+          case Notification.turnCompleted: {
+            const notification = params as { threadId?: string };
+            if (notification.threadId && notification.threadId !== threadId) return;
             resolve();
             break;
           }
-          case "error": {
-            const text = String(params["message"] ?? "unknown app-server error");
+          case Notification.error: {
+            const notification = params as ErrorNotification;
+            if (notification.threadId && notification.threadId !== threadId) return;
+            const text = notification.error?.message ?? "unknown app-server error";
             result.errors.push(text);
-            reject(new Error(text));
+            // Abandon the turn only on a terminal error. When the server sets
+            // `willRetry` it retries internally and a later `turn/completed` still
+            // arrives; rejecting here would tear the thread down mid-retry.
+            if (!notification.willRetry) reject(new Error(text));
             break;
           }
         }
@@ -301,14 +419,15 @@ export class AppServerClient {
 
     try {
       options.progress?.report("Starting codex turn...");
-      await this.request("turn/start", {
+      const turn = await this.request<TurnStartedResult>(Method.turnStart, {
         threadId,
         input: [{ type: "text", text: options.prompt, text_elements: [] }],
         cwd: options.cwd,
         sandboxPolicy,
         model: options.model,
         effort: options.effort,
-      });
+      } satisfies TurnStartParams);
+      const turnId = turn.turn?.id;
 
       await this.#withTimeout(
         completion,
@@ -316,43 +435,54 @@ export class AppServerClient {
         `codex turn on thread ${threadId}`,
         () => {
           // Best-effort: nudge the server to abandon the turn so its slot frees up.
-          void this.interrupt(threadId).catch(() => {});
+          // `turn/interrupt` needs the turn id as well as the thread id.
+          if (turnId) void this.interrupt(threadId, turnId).catch(() => {});
         },
       );
     } catch (error) {
-      // The thread is abandoned now — free its MCP stack instead of leaking it.
-      await this.disposeThread(threadId);
+      // Detach the thread's MCP stack, then hand the id back with the error so the
+      // caller can still surface a resumable threadId (the SQLite record survives
+      // an unsubscribe). See `unsubscribeThread` for why this is not a delete.
+      await this.unsubscribeThread(threadId);
+      if (error instanceof Error) (error as Error & { threadId?: string }).threadId = threadId;
       throw error;
     } finally {
       unsubscribe();
     }
 
-    // A throwaway thread (no caller will resume it) is deleted so the app-server
-    // drops it and terminates the per-thread MCP servers it spawned. Skipping this
-    // is the whole respawn-without-reap leak: one abandoned MCP stack per call.
-    if (!options.keepThread) await this.disposeThread(threadId);
+    // Unsubscribe after every completed turn so the app-server can unload the
+    // thread's MCP stack. The thread stays resumable by id, which is exactly the
+    // resume contract — so this runs unconditionally, not just for throwaway calls.
+    await this.unsubscribeThread(threadId);
     return result;
   }
 
   /** Cancel a turn in flight. The exec backend has no equivalent. */
-  async interrupt(threadId: string): Promise<void> {
-    await this.request("turn/interrupt", { threadId });
+  async interrupt(threadId: string, turnId: string): Promise<void> {
+    await this.request(Method.turnInterrupt, { threadId, turnId } satisfies TurnInterruptParams);
   }
 
   /**
-   * Delete a thread we are finished with. The app-server terminates that thread's
-   * MCP servers when the thread is dropped, so this is what stops a throwaway call
-   * from leaking a full MCP stack. Best-effort by design: a failure here must
-   * never surface to the caller or hold up a completed turn, so it is bounded by
-   * a short timeout and swallowed.
+   * Detach from a thread we are finished with for now. Unsubscribe lets the
+   * app-server unload the thread's MCP stack — the per-thread child processes it
+   * spawned — while leaving the thread's SQLite record intact and resumable by id.
+   * That is deliberately not `thread/delete`, which would destroy the thread and
+   * break the threadId resume contract; and it is not "keep it loaded", which
+   * leaks the MCP stack (the v0.4.1 scar). Best-effort by design: a failure here
+   * must never surface to the caller or hold up a completed turn, so it is bounded
+   * by a short timeout and swallowed.
    */
-  async disposeThread(threadId: string): Promise<void> {
+  async unsubscribeThread(threadId: string): Promise<void> {
     if (!this.#child) return;
     try {
-      await this.request("thread/delete", { threadId }, DISPOSE_TIMEOUT_MS);
+      await this.request(
+        Method.threadUnsubscribe,
+        { threadId } satisfies ThreadUnsubscribeParams,
+        DISPOSE_TIMEOUT_MS,
+      );
     } catch (error) {
       logger.debug(
-        `thread/delete failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
+        `thread/unsubscribe failed for ${threadId}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
@@ -385,29 +515,29 @@ export class AppServerClient {
   }
 
   /** Extract the fields the bridge reports from a completed item. */
-  #recordItem(result: CodexResult, item: Record<string, unknown> | undefined): void {
+  #recordItem(result: CodexResult, item: ThreadItemView | undefined): void {
     if (!item) return;
-    switch (item["type"]) {
+    switch (item.type) {
       case "agentMessage": {
-        const text = item["text"];
-        if (typeof text === "string") result.agentMessage += text;
+        if (typeof item.text === "string") result.agentMessage += item.text;
         break;
       }
       case "fileChange": {
-        const path = item["path"];
-        if (typeof path === "string") {
-          result.fileChanges.push({ path, kind: String(item["kind"] ?? "modify") });
+        // A fileChange item carries a list of per-path patches (not a single
+        // path/kind pair), each with the patch kind. Record every path touched.
+        for (const change of item.changes ?? []) {
+          if (typeof change.path === "string") {
+            result.fileChanges.push({ path: change.path, kind: String(change.kind ?? "modify") });
+          }
         }
         break;
       }
       case "commandExecution": {
-        const command = item["command"];
-        if (typeof command === "string") {
-          const exit = item["exitCode"];
+        if (typeof item.command === "string") {
           result.commandsExecuted.push({
-            command,
-            exitCode: typeof exit === "number" ? exit : null,
-            output: String(item["output"] ?? ""),
+            command: item.command,
+            exitCode: typeof item.exitCode === "number" ? item.exitCode : null,
+            output: item.aggregatedOutput ?? "",
           });
         }
         break;
@@ -420,5 +550,6 @@ export class AppServerClient {
     this.#child?.kill();
     this.#ready = null;
     this.#child = null;
+    this.#initialized = false;
   }
 }
