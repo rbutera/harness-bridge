@@ -12,6 +12,7 @@ import { formatCodexResponse } from "./lib/codex-response.js";
 import { AppServerClient, isAppServerEnabled } from "./lib/app-server.js";
 import { createHarnessServer, HARNESSES, type HarnessAdapter } from "./lib/harness.js";
 import { CODEX_MODELS } from "./lib/types.js";
+import { resolveCodexModel } from "./lib/codex-model.js";
 import type { CodexResult } from "./lib/types.js";
 
 /**
@@ -146,6 +147,10 @@ async function runCodex(prompt: string, options: CodexRunOptions = {}): Promise<
 
 async function runCodexUnlocked(prompt: string, options: CodexRunOptions): Promise<CodexResult> {
   const resumeThreadId = options.threadId ?? null;
+  // An explicit per-call model wins; otherwise HARNESS_BRIDGE_CODEX_MODEL pins this server's
+  // default (so Ark Threads can run implementation on one model without changing the machine-wide
+  // ~/.codex/config.toml default); otherwise Codex falls back to its own config.
+  options = { ...options, model: resolveCodexModel(options.model) };
 
   // Backend swap is invisible above this line: the MCP tool surface, and so
   // every caller and the codex-teammate agent, is identical either way.
