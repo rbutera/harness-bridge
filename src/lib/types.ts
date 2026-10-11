@@ -3,7 +3,13 @@
 // an agent that picks one from the enum gets a hang/timeout, not a downgrade —
 // they are traps, not compatibility. Prefer OMITting the model param entirely
 // so the ~/.codex/config.toml default (kept current) applies.
-export const CODEX_MODELS = ["gpt-5.6-sol", "gpt-5.5"] as const;
+export const CODEX_MODELS = [
+  "gpt-6.1-sol",
+  "gpt-6-sol",
+  "gpt-6-astra",
+  "gpt-5.6-sol",
+  "gpt-5.5",
+] as const;
 
 export type CodexModel = (typeof CODEX_MODELS)[number];
 
