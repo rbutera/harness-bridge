@@ -154,6 +154,79 @@ describe("AppServerClient thread lifecycle", () => {
     expect(fake.sentMethods).not.toContain("thread/delete");
   });
 
+  it("also unsubscribes the sub-agent threads the turn spawned, and no one else's", async () => {
+    const fake = createFakeChild("complete");
+    const parents: Record<string, string | null> = {
+      S1: "T1",
+      S2: "T1",
+      S1a: "S1", // a sub-agent's own sub-agent
+      OTHER: "X", // another caller's sub-agent on the same server
+      LONE: null,
+    };
+    fake.onRequest = (message, emit) => {
+      const id = message.id as number;
+      const params = (message.params ?? {}) as Record<string, unknown>;
+      if (message.method === "thread/loaded/list") {
+        emit({ id, result: { data: ["T1", ...Object.keys(parents)], nextCursor: null } });
+        return true;
+      }
+      if (message.method === "thread/read") {
+        const threadId = params["threadId"] as string;
+        emit({ id, result: { thread: { id: threadId, parentThreadId: parents[threadId] } } });
+        return true;
+      }
+      return false;
+    };
+    spawnMock.mockReturnValue(fake.child);
+
+    await new AppServerClient().runTurn({ prompt: "hi" });
+
+    const unsubscribed = fake.sent
+      .filter((m) => m.method === "thread/unsubscribe")
+      .map((m) => (m.params as Record<string, unknown>)["threadId"]);
+    expect(unsubscribed.sort()).toEqual(["S1", "S1a", "S2", "T1"]);
+    expect(unsubscribed.at(-1)).toBe("T1");
+    expect(fake.sentMethods).not.toContain("thread/delete");
+  });
+
+  it("still unsubscribes the thread when listing loaded threads fails", async () => {
+    const fake = createFakeChild("complete");
+    fake.onRequest = (message, emit) => {
+      if (message.method !== "thread/loaded/list") return false;
+      emit({ id: message.id as number, error: { code: -32603, message: "nope" } });
+      return true;
+    };
+    spawnMock.mockReturnValue(fake.child);
+
+    await new AppServerClient().runTurn({ prompt: "hi" });
+    const unsub = fake.sent.filter((m) => m.method === "thread/unsubscribe");
+    expect(unsub.map((m) => (m.params as Record<string, unknown>)["threadId"])).toEqual(["T1"]);
+  });
+
+  it("releases sub-agent threads after a failed turn too", async () => {
+    const fake = createFakeChild("error");
+    fake.onRequest = (message, emit) => {
+      const id = message.id as number;
+      if (message.method === "thread/loaded/list") {
+        emit({ id, result: { data: ["T1", "S1"], nextCursor: null } });
+        return true;
+      }
+      if (message.method === "thread/read") {
+        emit({ id, result: { thread: { id: "S1", parentThreadId: "T1" } } });
+        return true;
+      }
+      return false;
+    };
+    spawnMock.mockReturnValue(fake.child);
+
+    await expect(new AppServerClient().runTurn({ prompt: "hi" })).rejects.toThrow(/boom/);
+    const unsub = fake.sent.filter((m) => m.method === "thread/unsubscribe");
+    expect(unsub.map((m) => (m.params as Record<string, unknown>)["threadId"])).toEqual([
+      "S1",
+      "T1",
+    ]);
+  });
+
   it("attaches the created thread id to a turn error so the caller can resume it", async () => {
     const fake = createFakeChild("error");
     spawnMock.mockReturnValue(fake.child);

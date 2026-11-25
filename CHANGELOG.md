@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 - 2026-11-25
+
+### Fixed
+
+- Sub-agent threads no longer leak their MCP stacks. With Codex's multi-agent tools on, a turn can spawn sub-agent threads, each loading its own MCP servers; the bridge unsubscribed only the main thread, so on codex 0.171.0 every sub-agent stayed loaded, its MCP servers running, until the app-server exited (one long-lived bridge reached 124 processes, about 16G, in a day). After each turn the bridge now lists the loaded threads, finds the ones descended from its thread by `parentThreadId`, and unsubscribes them too. Other callers' threads on the same server are left alone. Measured on one call that spawns two sub-agents: 1.0.0 leaves 8 processes under the bridge for good, 1.0.1 settles at 2 (the app-server and its code-mode host) once the server's ~60s idle unload runs.
+- Also includes `HARNESS_BRIDGE_CODEX_MODEL` (#4), unreleased until now.
+
 ## 1.0.0 - 2026-08-28
 
 ### Breaking

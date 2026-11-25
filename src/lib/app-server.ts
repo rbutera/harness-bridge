@@ -21,6 +21,10 @@ import {
   type InitializeParams,
   type ItemNotification,
   type ThreadItemView,
+  type ThreadLoadedListParams,
+  type ThreadLoadedListResponse,
+  type ThreadReadParams,
+  type ThreadReadResult,
   type ThreadResumeParams,
   type ThreadStartParams,
   type ThreadStartedResult,
@@ -440,10 +444,11 @@ export class AppServerClient {
         },
       );
     } catch (error) {
-      // Detach the thread's MCP stack, then hand the id back with the error so the
-      // caller can still surface a resumable threadId (the SQLite record survives
-      // an unsubscribe). See `unsubscribeThread` for why this is not a delete.
-      await this.unsubscribeThread(threadId);
+      // Detach the thread's MCP stack (and its sub-agents'), then hand the id back
+      // with the error so the caller can still surface a resumable threadId (the
+      // SQLite record survives an unsubscribe). See `unsubscribeThread` for why
+      // this is not a delete.
+      await this.releaseThread(threadId);
       if (error instanceof Error) (error as Error & { threadId?: string }).threadId = threadId;
       throw error;
     } finally {
@@ -451,15 +456,91 @@ export class AppServerClient {
     }
 
     // Unsubscribe after every completed turn so the app-server can unload the
-    // thread's MCP stack. The thread stays resumable by id, which is exactly the
-    // resume contract — so this runs unconditionally, not just for throwaway calls.
-    await this.unsubscribeThread(threadId);
+    // thread's MCP stack, and its sub-agents' stacks. The thread stays resumable by
+    // id, which is exactly the resume contract — so this runs unconditionally, not
+    // just for throwaway calls.
+    await this.releaseThread(threadId);
     return result;
   }
 
   /** Cancel a turn in flight. The exec backend has no equivalent. */
   async interrupt(threadId: string, turnId: string): Promise<void> {
     await this.request(Method.turnInterrupt, { threadId, turnId } satisfies TurnInterruptParams);
+  }
+
+  /**
+   * Release a finished thread together with every sub-agent thread it spawned.
+   *
+   * With Codex's multi-agent tools on, a turn can spawn sub-agent threads, and
+   * each one loads its own MCP stack (one process per configured stdio server).
+   * Unsubscribing the parent does not unload them: measured on codex 0.171.0, a
+   * sub-agent thread stays loaded, its MCP servers running, until the app-server
+   * exits. On a long-lived bridge that grew to 124 processes (16G) in a day. So we
+   * find the loaded threads descended from this one (by `parentThreadId`) and
+   * unsubscribe each of them as well; the server then unloads them after its idle
+   * grace period, like the parent. Threads of other callers sharing this server are
+   * never touched: only this thread's descendants are released. Best-effort, like
+   * `unsubscribeThread`.
+   */
+  async releaseThread(threadId: string): Promise<void> {
+    for (const descendant of await this.#loadedDescendants(threadId)) {
+      await this.unsubscribeThread(descendant);
+    }
+    await this.unsubscribeThread(threadId);
+  }
+
+  /** Loaded threads whose `parentThreadId` chain leads back to `rootId`. */
+  async #loadedDescendants(rootId: string): Promise<string[]> {
+    if (!this.#child) return [];
+    const loaded: string[] = [];
+    try {
+      let cursor: string | null | undefined;
+      do {
+        const page = await this.request<ThreadLoadedListResponse | undefined>(
+          Method.threadLoadedList,
+          { cursor } satisfies ThreadLoadedListParams,
+          DISPOSE_TIMEOUT_MS,
+        );
+        loaded.push(...(page?.data ?? []));
+        cursor = page?.nextCursor;
+      } while (cursor);
+    } catch (error) {
+      logger.debug(
+        `thread/loaded/list failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    }
+
+    const parentOf = new Map<string, string>();
+    for (const id of loaded) {
+      if (id === rootId) continue;
+      try {
+        const read = await this.request<ThreadReadResult | undefined>(
+          Method.threadRead,
+          { threadId: id } satisfies ThreadReadParams,
+          DISPOSE_TIMEOUT_MS,
+        );
+        const parent = read?.thread?.parentThreadId;
+        if (parent) parentOf.set(id, parent);
+      } catch (error) {
+        logger.debug(
+          `thread/read failed for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    const family = new Set([rootId]);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const [id, parent] of parentOf) {
+        if (!family.has(id) && family.has(parent)) {
+          family.add(id);
+          grew = true;
+        }
+      }
+    }
+    family.delete(rootId);
+    return [...family];
   }
 
   /**
