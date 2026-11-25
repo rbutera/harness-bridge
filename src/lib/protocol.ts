@@ -29,6 +29,9 @@ export type { TurnStartParams } from "../generated/v2/TurnStartParams.js";
 export type { TurnInterruptParams } from "../generated/v2/TurnInterruptParams.js";
 export type { ThreadDeleteParams } from "../generated/v2/ThreadDeleteParams.js";
 export type { ThreadUnsubscribeParams } from "../generated/v2/ThreadUnsubscribeParams.js";
+export type { ThreadReadParams } from "../generated/v2/ThreadReadParams.js";
+export type { ThreadLoadedListParams } from "../generated/v2/ThreadLoadedListParams.js";
+export type { ThreadLoadedListResponse } from "../generated/v2/ThreadLoadedListResponse.js";
 export type { SandboxMode } from "../generated/v2/SandboxMode.js";
 export type { SandboxPolicy } from "../generated/v2/SandboxPolicy.js";
 import type { TokenUsageBreakdown } from "../generated/v2/TokenUsageBreakdown.js";
@@ -42,6 +45,8 @@ export const Method = {
   turnInterrupt: "turn/interrupt",
   threadDelete: "thread/delete",
   threadUnsubscribe: "thread/unsubscribe",
+  threadRead: "thread/read",
+  threadLoadedList: "thread/loaded/list",
 } as const;
 
 /** Wire notification method names the client reacts to (see ServerNotification). */
@@ -54,6 +59,14 @@ export const Notification = {
 } as const;
 
 // --- Incoming reads: narrow views mirroring the generated shapes --------------
+
+/**
+ * `thread/read` answers `{ thread: Thread }` (ThreadReadResponse). We read only
+ * `parentThreadId`, which the server sets on sub-agent threads.
+ */
+export interface ThreadReadResult {
+  thread?: { id?: string; parentThreadId?: string | null };
+}
 
 /**
  * `thread/start` and `thread/resume` both answer with `{ thread: Thread, ... }`.
